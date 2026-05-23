@@ -1,0 +1,445 @@
+import { createFileRoute } from '@tanstack/react-router'
+import { AlertTriangle, Bell, Camera, Eye, EyeOff, Lock, Save, Trash2, User } from 'lucide-react'
+import { useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import { cn } from '@/lib/utils'
+import { useAuthStore } from '@/stores/auth'
+
+export const Route = createFileRoute('/_authenticated/settings')({
+  component: SettingsPage,
+})
+
+function SettingsPage() {
+  const { t } = useTranslation('common')
+
+  return (
+    <div className="bg-surface p-6 lg:p-8">
+      <div className="mb-8">
+        <h1 className="text-2xl font-semibold text-primary-600">{t('settings')}</h1>
+        <p className="mt-1 text-sm text-on-surface-muted">{t('settings_subtitle')}</p>
+      </div>
+
+      <div className="mx-auto max-w-2xl space-y-6">
+        <ProfileSection />
+        <NotificationPreferencesSection />
+        <PasswordSection />
+        <DangerZoneSection />
+      </div>
+    </div>
+  )
+}
+
+function SectionCard({
+  icon,
+  title,
+  children,
+  variant,
+}: {
+  icon: React.ReactNode
+  title: string
+  children: React.ReactNode
+  variant?: 'default' | 'danger'
+}) {
+  return (
+    <div
+      className={cn(
+        'rounded-xl border',
+        variant === 'danger'
+          ? 'border-error-500/30 bg-surface-bright'
+          : 'border-outline-dim/20 bg-surface-bright',
+      )}
+    >
+      <div
+        className={cn(
+          'flex items-center gap-2 border-b px-6 py-4',
+          variant === 'danger' ? 'border-error-500/30' : 'border-outline-dim/20',
+        )}
+      >
+        {icon}
+        <h2
+          className={cn(
+            'text-base font-semibold',
+            variant === 'danger' ? 'text-error-600' : 'text-primary-600',
+          )}
+        >
+          {title}
+        </h2>
+      </div>
+      <div className="p-6">{children}</div>
+    </div>
+  )
+}
+
+function ProfileSection() {
+  const { t } = useTranslation('common')
+  const { user } = useAuthStore()
+  const [name, setName] = useState(user?.name ?? '')
+  const [saving, setSaving] = useState(false)
+  const [saved, setSaved] = useState(false)
+
+  function handleSaveProfile() {
+    setSaving(true)
+    setSaved(false)
+    setTimeout(() => {
+      setSaving(false)
+      setSaved(true)
+      setTimeout(() => setSaved(false), 3000)
+    }, 800)
+  }
+
+  return (
+    <SectionCard icon={<User className="h-5 w-5 text-success-600" />} title={t('profile')}>
+      <div className="space-y-5">
+        <div className="flex items-center gap-4">
+          <div className="relative">
+            <div className="flex h-16 w-16 items-center justify-center rounded-full bg-surface-container text-xl font-bold text-primary-600">
+              {(user?.name?.[0] ?? 'U').toUpperCase()}
+            </div>
+            <button
+              type="button"
+              className="absolute -bottom-1 -right-1 flex h-7 w-7 items-center justify-center rounded-full border-2 border-outline-dim/20 bg-primary-600 text-white transition-colors hover:opacity-90"
+              title={t('change_avatar')}
+            >
+              <Camera className="h-3.5 w-3.5" />
+            </button>
+          </div>
+          <div>
+            <p className="text-sm font-medium text-on-surface">{user?.name ?? '-'}</p>
+            <p className="text-xs text-on-surface-muted">{user?.email ?? '-'}</p>
+          </div>
+        </div>
+
+        <div>
+          <label
+            htmlFor="settings-name"
+            className="mb-1 block text-sm font-medium text-on-surface-muted"
+          >
+            {t('name')}
+          </label>
+          <input
+            id="settings-name"
+            type="text"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            className="w-full rounded-lg border border-outline-dim/20 bg-surface-container px-3 py-2.5 text-sm text-on-surface focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500/30"
+          />
+        </div>
+
+        <div>
+          <label
+            htmlFor="settings-email"
+            className="mb-1 block text-sm font-medium text-on-surface-muted"
+          >
+            {t('email')}
+          </label>
+          <input
+            id="settings-email"
+            type="email"
+            value={user?.email ?? ''}
+            disabled
+            className="w-full rounded-lg border border-outline-dim/20/20 bg-surface-container px-3 py-2.5 text-sm text-on-surface-muted"
+          />
+        </div>
+
+        <div>
+          <label
+            htmlFor="settings-phone"
+            className="mb-1 block text-sm font-medium text-on-surface-muted"
+          >
+            {t('phone')}
+          </label>
+          <div className="flex gap-2">
+            <input
+              id="settings-phone"
+              type="tel"
+              value={user?.phone ?? ''}
+              disabled
+              className="flex-1 rounded-lg border border-outline-dim/20/20 bg-surface-container px-3 py-2.5 text-sm text-on-surface-muted"
+            />
+            <button
+              type="button"
+              className="rounded-lg border border-outline-dim/20/50 px-3 py-2.5 text-sm font-medium text-on-surface-muted transition-colors hover:bg-surface-container"
+            >
+              {t('change')}
+            </button>
+          </div>
+        </div>
+
+        <div className="flex items-center justify-end gap-2">
+          {saved && <span className="text-sm text-success-600">{t('saved')}</span>}
+          <button
+            type="button"
+            onClick={handleSaveProfile}
+            disabled={saving}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-success-500 px-4 py-2 text-sm font-bold text-primary-800 transition-colors hover:bg-success-500/90 disabled:opacity-50"
+          >
+            <Save className="h-4 w-4" />
+            {saving ? t('loading') : t('save')}
+          </button>
+        </div>
+      </div>
+    </SectionCard>
+  )
+}
+
+function NotificationPreferencesSection() {
+  const { t } = useTranslation('common')
+  const [emailNotif, setEmailNotif] = useState(true)
+  const [projectUpdates, setProjectUpdates] = useState(true)
+  const [paymentAlerts, setPaymentAlerts] = useState(true)
+
+  const toggles = [
+    {
+      id: 'email-notifications',
+      label: t('email_notifications'),
+      description: t('email_notifications_desc'),
+      checked: emailNotif,
+      onChange: setEmailNotif,
+    },
+    {
+      id: 'project-updates',
+      label: t('project_updates'),
+      description: t('project_updates_desc'),
+      checked: projectUpdates,
+      onChange: setProjectUpdates,
+    },
+    {
+      id: 'payment-alerts',
+      label: t('payment_alerts'),
+      description: t('payment_alerts_desc'),
+      checked: paymentAlerts,
+      onChange: setPaymentAlerts,
+    },
+  ]
+
+  return (
+    <SectionCard
+      icon={<Bell className="h-5 w-5 text-primary-600" />}
+      title={t('notification_preferences')}
+    >
+      <div className="space-y-4">
+        {toggles.map((toggle) => (
+          <div key={toggle.id} className="flex items-center justify-between gap-4">
+            <div>
+              <label htmlFor={toggle.id} className="text-sm font-medium text-on-surface-muted">
+                {toggle.label}
+              </label>
+              <p className="text-xs text-on-surface-muted">{toggle.description}</p>
+            </div>
+            <button
+              id={toggle.id}
+              type="button"
+              role="switch"
+              aria-checked={toggle.checked}
+              onClick={() => toggle.onChange(!toggle.checked)}
+              className={cn(
+                'relative inline-flex h-6 w-11 shrink-0 cursor-pointer items-center rounded-full transition-colors',
+                toggle.checked ? 'bg-success-500' : 'bg-surface-bright',
+              )}
+            >
+              <span
+                className={cn(
+                  'inline-block h-4 w-4 rounded-full bg-white transition-transform',
+                  toggle.checked ? 'translate-x-6' : 'translate-x-1',
+                )}
+              />
+            </button>
+          </div>
+        ))}
+      </div>
+    </SectionCard>
+  )
+}
+
+function PasswordSection() {
+  const { t } = useTranslation('common')
+  const [currentPassword, setCurrentPassword] = useState('')
+  const [newPassword, setNewPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
+  const [showCurrent, setShowCurrent] = useState(false)
+  const [showNew, setShowNew] = useState(false)
+  const [error, setError] = useState('')
+  const [success, setSuccess] = useState(false)
+
+  function handleChangePassword() {
+    setError('')
+    setSuccess(false)
+
+    if (newPassword !== confirmPassword) {
+      setError(t('password_mismatch'))
+      return
+    }
+    if (newPassword.length < 8) {
+      setError(t('password_min_length'))
+      return
+    }
+
+    setSuccess(true)
+    setCurrentPassword('')
+    setNewPassword('')
+    setConfirmPassword('')
+    setTimeout(() => setSuccess(false), 3000)
+  }
+
+  const canSubmit =
+    currentPassword.length > 0 && newPassword.length >= 8 && confirmPassword.length > 0
+
+  return (
+    <SectionCard
+      icon={<Lock className="h-5 w-5 text-on-surface-muted" />}
+      title={t('change_password')}
+    >
+      <div className="space-y-4">
+        {error && (
+          <div className="rounded-lg bg-error-500/10 p-3 text-sm text-error-600">{error}</div>
+        )}
+        {success && (
+          <div className="rounded-lg bg-success-500/10 p-3 text-sm text-success-600">
+            {t('password_changed')}
+          </div>
+        )}
+
+        <div>
+          <label
+            htmlFor="current-password"
+            className="mb-1 block text-sm font-medium text-on-surface-muted"
+          >
+            {t('current_password')}
+          </label>
+          <div className="relative">
+            <input
+              id="current-password"
+              type={showCurrent ? 'text' : 'password'}
+              value={currentPassword}
+              onChange={(e) => setCurrentPassword(e.target.value)}
+              className="w-full rounded-lg border border-outline-dim/20 bg-surface-container px-3 py-2.5 pr-10 text-sm text-on-surface focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500/30"
+            />
+            <button
+              type="button"
+              onClick={() => setShowCurrent(!showCurrent)}
+              className="absolute right-2 top-1/2 -translate-y-1/2 text-on-surface-muted hover:text-on-surface-muted"
+              aria-label={showCurrent ? t('hide_password') : t('show_password')}
+            >
+              {showCurrent ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+            </button>
+          </div>
+        </div>
+
+        <div>
+          <label
+            htmlFor="new-password"
+            className="mb-1 block text-sm font-medium text-on-surface-muted"
+          >
+            {t('new_password')}
+          </label>
+          <div className="relative">
+            <input
+              id="new-password"
+              type={showNew ? 'text' : 'password'}
+              value={newPassword}
+              onChange={(e) => setNewPassword(e.target.value)}
+              className="w-full rounded-lg border border-outline-dim/20 bg-surface-container px-3 py-2.5 pr-10 text-sm text-on-surface focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500/30"
+            />
+            <button
+              type="button"
+              onClick={() => setShowNew(!showNew)}
+              className="absolute right-2 top-1/2 -translate-y-1/2 text-on-surface-muted hover:text-on-surface-muted"
+              aria-label={showNew ? t('hide_password') : t('show_password')}
+            >
+              {showNew ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+            </button>
+          </div>
+          <p className="mt-1 text-xs text-on-surface-muted">{t('password_hint')}</p>
+        </div>
+
+        <div>
+          <label
+            htmlFor="confirm-password"
+            className="mb-1 block text-sm font-medium text-on-surface-muted"
+          >
+            {t('confirm_password')}
+          </label>
+          <input
+            id="confirm-password"
+            type="password"
+            value={confirmPassword}
+            onChange={(e) => setConfirmPassword(e.target.value)}
+            className="w-full rounded-lg border border-outline-dim/20 bg-surface-container px-3 py-2.5 text-sm text-on-surface focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500/30"
+          />
+        </div>
+
+        <div className="flex justify-end">
+          <button
+            type="button"
+            onClick={handleChangePassword}
+            disabled={!canSubmit}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-success-500 px-4 py-2 text-sm font-bold text-primary-800 transition-colors hover:bg-success-500/90 disabled:opacity-50"
+          >
+            <Lock className="h-4 w-4" />
+            {t('change_password')}
+          </button>
+        </div>
+      </div>
+    </SectionCard>
+  )
+}
+
+function DangerZoneSection() {
+  const { t } = useTranslation('common')
+  const [showConfirm, setShowConfirm] = useState(false)
+  const [confirmText, setConfirmText] = useState('')
+
+  return (
+    <SectionCard
+      icon={<AlertTriangle className="h-5 w-5 text-error-600" />}
+      title={t('danger_zone')}
+      variant="danger"
+    >
+      <div>
+        <p className="text-sm text-on-surface-muted">{t('delete_account_warning')}</p>
+
+        {!showConfirm ? (
+          <button
+            type="button"
+            onClick={() => setShowConfirm(true)}
+            className="mt-4 inline-flex items-center gap-1.5 rounded-lg border border-error-500/30 px-4 py-2 text-sm font-medium text-error-600 transition-colors hover:bg-error-500/10"
+          >
+            <Trash2 className="h-4 w-4" />
+            {t('delete_account')}
+          </button>
+        ) : (
+          <div className="mt-4 rounded-lg border border-error-500/30 bg-error-500/10 p-4">
+            <p className="mb-3 text-sm font-medium text-error-600">{t('delete_confirm_prompt')}</p>
+            <input
+              type="text"
+              value={confirmText}
+              onChange={(e) => setConfirmText(e.target.value)}
+              placeholder="HAPUS"
+              className="w-full rounded-lg border border-error-500/30 bg-surface-container px-3 py-2.5 text-sm text-on-surface placeholder:text-on-surface-muted focus:border-error-500/50 focus:outline-none focus:ring-1 focus:ring-error-500/50"
+            />
+            <div className="mt-3 flex gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setShowConfirm(false)
+                  setConfirmText('')
+                }}
+                className="rounded-lg border border-outline-dim/20/50 px-4 py-2 text-sm font-medium text-on-surface-muted transition-colors hover:bg-surface-container"
+              >
+                {t('cancel')}
+              </button>
+              <button
+                type="button"
+                disabled={confirmText !== 'HAPUS'}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-error-500 px-4 py-2 text-sm font-bold text-white transition-colors hover:bg-error-500/90 disabled:opacity-50"
+              >
+                <Trash2 className="h-4 w-4" />
+                {t('confirm_delete')}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </SectionCard>
+  )
+}
