@@ -16,13 +16,11 @@ __pycache__/
 .ruff_cache/
 apps/ai-service/.venv/
 image_*
-.claude/
 .env.example
 PROJECT_AUDIT*
 scripts/
 coverage/
 .env.production
-CLAUDE.md
 memory/
 
 # Go build artifacts
