@@ -2,12 +2,17 @@ import json
 import logging
 import os
 from collections.abc import AsyncIterator
+from typing import Literal
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
+from app.middleware.auth import require_service_auth
 from app.models.schemas import (
+    BrdSectionScore,
+    BrdTemplateScore,
     ChatRequest,
     ChatResponse,
     CvParseRequest,
@@ -20,8 +25,10 @@ from app.models.schemas import (
     MatchingRequest,
     MatchingResponse,
     ParseSpecData,
+    ParseSpecRequest,
     ParseSpecResponse,
 )
+from app.services.nats_client import publish_event
 
 logger = logging.getLogger(__name__)
 
@@ -29,33 +36,241 @@ router = APIRouter()
 
 TENSORZERO_URL = os.getenv("TENSORZERO_API_URL", "http://localhost:3333")
 PROJECT_SERVICE_URL = os.getenv("PROJECT_SERVICE_URL", "http://localhost:3002")
-INTERNAL_SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "")
+
+
+def _service_auth_secret() -> str:
+    """Outgoing X-Service-Auth secret. Read at call time so tests can override."""
+    return os.getenv("SERVICE_AUTH_SECRET", "")
 
 
 def calculate_completeness(messages: list) -> int:
-    """Calculate completeness based on information coverage."""
+    """Score chat conversation against BRD template info requirements (sections B-N).
+
+    Each check maps to a BRD template section that needs real data from the client.
+    Score = covered_checks / total_checks * 100.
+    """
     user_messages = [m.content.lower() for m in messages if m.role == "user"]
     if not user_messages:
         return 0
 
     all_text = " ".join(user_messages)
 
+    # Section B — Executive Summary: project description present
+    has_description = len(all_text) > 80
+
+    # Section C — Problem Statement: pain points or motivation
+    has_problem = any(w in all_text for w in [
+        "masalah", "problem", "kendala", "pain", "isu", "issue",
+        "saat ini", "currently", "manual", "tidak bisa", "belum ada",
+    ])
+
+    # Section D — Business Objectives: goals
+    has_objectives = any(w in all_text for w in [
+        "tujuan", "goal", "objective", "target", "ingin", "mau", "want",
+        "meningkatkan", "increase", "menurunkan", "reduce",
+    ])
+
+    # Section E — Scope: features (in-scope)
+    has_features = any(w in all_text for w in [
+        "fitur", "feature", "fungsi", "function", "modul", "module",
+        "halaman", "page", "dashboard", "login", "register",
+    ])
+
+    # Section G — Target Users
+    has_users = any(w in all_text for w in [
+        "user", "pengguna", "pelanggan", "customer", "target", "audience",
+        "admin", "konsumen", "pembeli", "buyer",
+    ])
+
+    # Section H — Business Needs: non-trivial requirement detail
+    has_requirements = len(all_text) > 300 and any(w in all_text for w in [
+        "harus", "must", "perlu", "need", "require", "wajib",
+        "sistem", "system", "data", "laporan", "report",
+    ])
+
+    # Section K — Risks / Assumptions
+    has_risks_or_constraints = any(w in all_text for w in [
+        "risiko", "risk", "asumsi", "assumption", "keterbatasan", "constraint",
+        "tantangan", "challenge", "hambatan",
+    ])
+
+    # Section L — Success Metrics
+    has_metrics = any(w in all_text for w in [
+        "metrik", "metric", "kpi", "ukur", "measure", "sukses", "success",
+        "persentase", "percent", "angka", "number", "target",
+    ])
+
+    # Section M — Constraints: budget
+    has_budget = any(w in all_text for w in [
+        "budget", "biaya", "harga", "anggaran", "rp", "juta", "ribu",
+        "million", "cost", "dana",
+    ])
+
+    # Section M — Constraints: timeline
+    has_timeline = any(w in all_text for w in [
+        "deadline", "waktu", "timeline", "kapan", "bulan", "minggu",
+        "hari", "day", "week", "month", "selesai", "launch",
+    ])
+
+    # Integrations (enriches H and E)
+    has_integrations = any(w in all_text for w in [
+        "integrasi", "integration", "api", "payment", "pembayaran",
+        "whatsapp", "google", "midtrans", "xendit", "notifikasi",
+    ])
+
     checks = [
-        len(user_messages) >= 1,
-        len(all_text) > 50,
-        any(w in all_text for w in ["fitur", "feature", "fungsi", "function"]),
-        any(w in all_text for w in ["user", "pengguna", "target", "audience"]),
-        any(w in all_text for w in ["budget", "biaya", "harga", "anggaran"]),
-        any(w in all_text for w in ["deadline", "waktu", "timeline", "kapan"]),
-        any(w in all_text for w in ["integrasi", "integration", "api", "sistem"]),
-        any(w in all_text for w in ["prioritas", "priority", "utama", "penting"]),
+        has_description,
+        has_problem,
+        has_objectives,
+        has_features,
+        has_users,
+        has_requirements,
+        has_risks_or_constraints,
+        has_metrics,
+        has_budget,
+        has_timeline,
+        has_integrations,
     ]
 
     score = sum(checks) / len(checks) * 100
     return min(100, int(score))
 
 
-@router.post("/chat", response_model=ChatResponse)
+def _score_brd_against_template(brd: dict) -> BrdTemplateScore:
+    """Score generated BRD dict against KerjaCUS! BRD template sections (A-N).
+
+    Template sections mapped to BrdDocument fields:
+      B  Executive Summary     → executive_summary (length + substance)
+      D  Business Objectives   → business_objectives (count + specificity)
+      E  Scope                 → scope + out_of_scope
+      H  Business Needs/Reqs  → functional_requirements + non_functional_requirements
+      K  Risks & Assumptions   → risk_assessment
+      L  Success Metrics       → success_metrics
+      M  Constraints           → estimated_price_min/max + estimated_timeline_days
+    Sections F (Stakeholders), G (Target Users), I (Business Rules),
+    J (Expected Benefits), N (Timeline detail) are not in BrdDocument schema —
+    marked as gaps with score 0.
+    """
+
+    def _score_text(val: object, min_len: int = 100) -> tuple[int, str]:
+        if not val:
+            return 0, "empty"
+        text = str(val)
+        if len(text) >= min_len * 2:
+            return 100, f"{len(text)} chars"
+        if len(text) >= min_len:
+            return 70, f"{len(text)} chars (adequate)"
+        return 40, f"{len(text)} chars (too brief)"
+
+    def _score_list(val: object, min_items: int = 3, ideal: int = 5) -> tuple[int, str]:
+        if not val or not isinstance(val, list):
+            return 0, "empty"
+        n = len(val)
+        if n >= ideal:
+            return 100, f"{n} items"
+        if n >= min_items:
+            return 70, f"{n} items (adequate, aim for {ideal}+)"
+        if n >= 1:
+            return 40, f"{n} item(s) (too few, need {min_items}+)"
+        return 0, "empty list"
+
+    sections: list[BrdSectionScore] = []
+
+    # B — Executive Summary
+    s, r = _score_text(brd.get("executive_summary"), min_len=150)
+    sections.append(BrdSectionScore(section="B", label="Executive Summary", score=s, reason=r))
+
+    # D — Business Objectives
+    s, r = _score_list(brd.get("business_objectives"), min_items=4, ideal=6)
+    sections.append(BrdSectionScore(section="D", label="Business Objectives", score=s, reason=r))
+
+    # E — Scope (in-scope)
+    s, r = _score_text(brd.get("scope"), min_len=80)
+    sections.append(BrdSectionScore(section="E", label="Scope (In-Scope)", score=s, reason=r))
+
+    # E — Scope (out-of-scope)
+    s, r = _score_list(brd.get("out_of_scope"), min_items=3, ideal=5)
+    sections.append(BrdSectionScore(section="E", label="Scope (Out-of-Scope)", score=s, reason=r))
+
+    # F — Stakeholders (not in schema — always gap)
+    sections.append(BrdSectionScore(
+        section="F", label="Stakeholders & Roles",
+        score=0, reason="Not captured in current BRD schema",
+    ))
+
+    # G — Target Users (not in schema — always gap)
+    sections.append(BrdSectionScore(
+        section="G", label="Target User Segments",
+        score=0, reason="Not captured in current BRD schema",
+    ))
+
+    # H — Functional Requirements
+    s, r = _score_list(brd.get("functional_requirements"), min_items=4, ideal=7)
+    sections.append(BrdSectionScore(section="H", label="Functional Requirements", score=s, reason=r))
+
+    # H — Non-Functional Requirements
+    s, r = _score_list(brd.get("non_functional_requirements"), min_items=4, ideal=7)
+    sections.append(BrdSectionScore(section="H", label="Non-Functional Requirements", score=s, reason=r))
+
+    # I — Business Rules (not in schema — gap)
+    sections.append(BrdSectionScore(
+        section="I", label="Business Rules",
+        score=0, reason="Not captured in current BRD schema",
+    ))
+
+    # J — Expected Benefits (not in schema — gap)
+    sections.append(BrdSectionScore(
+        section="J", label="Expected Benefits",
+        score=0, reason="Not captured in current BRD schema",
+    ))
+
+    # K — Risks & Assumptions
+    s, r = _score_list(brd.get("risk_assessment"), min_items=3, ideal=5)
+    sections.append(BrdSectionScore(section="K", label="Risks & Assumptions", score=s, reason=r))
+
+    # L — Success Metrics
+    s, r = _score_list(brd.get("success_metrics"), min_items=3, ideal=5)
+    sections.append(BrdSectionScore(section="L", label="Success Metrics", score=s, reason=r))
+
+    # M — Budget constraint
+    price_min = brd.get("estimated_price_min", 0)
+    price_max = brd.get("estimated_price_max", 0)
+    if price_min > 0 and price_max > 0:
+        bm_score, bm_reason = 100, f"Rp {price_min:,} – Rp {price_max:,}"
+    elif price_min > 0 or price_max > 0:
+        bm_score, bm_reason = 60, "Partial budget range"
+    else:
+        bm_score, bm_reason = 0, "No budget estimate"
+    sections.append(BrdSectionScore(section="M", label="Budget Estimate", score=bm_score, reason=bm_reason))
+
+    # M — Timeline & team size constraint
+    tl = brd.get("estimated_timeline_days", 0)
+    ts = brd.get("estimated_team_size", 0)
+    if tl > 0 and ts > 0:
+        tl_score, tl_reason = 100, f"{tl} days, {ts} person(s)"
+    elif tl > 0:
+        tl_score, tl_reason = 60, f"{tl} days (team size missing)"
+    else:
+        tl_score, tl_reason = 0, "No timeline estimate"
+    sections.append(BrdSectionScore(section="M", label="Timeline & Team Size", score=tl_score, reason=tl_reason))
+
+    # N — High-level timeline phases (not in schema — gap)
+    sections.append(BrdSectionScore(
+        section="N", label="High-Level Timeline Phases",
+        score=0, reason="Not captured in current BRD schema",
+    ))
+
+    total = sum(s.score for s in sections)
+    overall = round(total / len(sections)) if sections else 0
+    return BrdTemplateScore(overall=overall, sections=sections)
+
+
+@router.post(
+    "/chat",
+    response_model=ChatResponse,
+    dependencies=[Depends(require_service_auth)],
+    responses={502: {"description": "AI gateway unreachable"}},
+)
 async def chat_completion(request: ChatRequest):
     """AI chatbot for project scoping follow-up. Enriches context via RAG over past BRDs."""
     messages_payload = await _build_chat_messages_with_rag(request)
@@ -206,7 +421,17 @@ def _extract_delta_text(chunk: dict) -> str:
     return ""
 
 
-@router.post("/chat/stream")
+@router.post(
+    "/chat/stream",
+    dependencies=[Depends(require_service_auth)],
+    responses={
+        200: {
+            "content": {"text/event-stream": {"schema": {}}},
+            "description": "Server-Sent Events token stream",
+        },
+        502: {"description": "AI gateway unreachable"},
+    },
+)
 async def chat_stream(request: ChatRequest):
     """Server-Sent Events stream for chatbot tokens; terminal event carries completeness."""
     messages_payload = await _build_chat_messages_with_rag(request)
@@ -445,7 +670,12 @@ def _parse_brd_response(text: str, request: GenerateBrdRequest) -> dict:
     }
 
 
-@router.post("/generate-brd", response_model=GenerateBrdResponse)
+@router.post(
+    "/generate-brd",
+    response_model=GenerateBrdResponse,
+    dependencies=[Depends(require_service_auth)],
+    responses={502: {"description": "AI gateway unreachable"}},
+)
 async def generate_brd(request: GenerateBrdRequest):
     """Generate BRD from conversation history via TensorZero LLM gateway."""
     messages = _build_brd_messages(request)
@@ -479,10 +709,23 @@ async def generate_brd(request: GenerateBrdRequest):
         # TensorZero unavailable or returned unexpected shape -- use fallback
         brd = _build_fallback_brd(request)
 
+    template_score = _score_brd_against_template(brd)
+
+    await publish_event(
+        "ai.brd.generated",
+        {
+            "projectId": request.project_id,
+            "tokensUsed": tokens_used,
+            "model": model_used,
+            "templateScore": template_score.overall,
+        },
+    )
+
     return GenerateBrdResponse(
         brd=brd,
         tokens_used=tokens_used,
         model=model_used,
+        template_score=template_score,
     )
 
 
@@ -733,7 +976,12 @@ def _parse_prd_response(text: str, request: GeneratePrdRequest) -> dict:
     }
 
 
-@router.post("/generate-prd", response_model=GeneratePrdResponse)
+@router.post(
+    "/generate-prd",
+    response_model=GeneratePrdResponse,
+    dependencies=[Depends(require_service_auth)],
+    responses={502: {"description": "AI gateway unreachable"}},
+)
 async def generate_prd(request: GeneratePrdRequest):
     """Generate PRD from BRD content and conversation history via TensorZero LLM gateway."""
     messages = _build_prd_messages(request)
@@ -766,6 +1014,15 @@ async def generate_prd(request: GeneratePrdRequest):
     except (httpx.HTTPError, KeyError, IndexError):
         prd = _build_fallback_prd(request)
 
+    await publish_event(
+        "ai.prd.generated",
+        {
+            "projectId": request.project_id,
+            "tokensUsed": tokens_used,
+            "model": model_used,
+        },
+    )
+
     return GeneratePrdResponse(
         prd=prd,
         tokens_used=tokens_used,
@@ -773,7 +1030,10 @@ async def generate_prd(request: GeneratePrdRequest):
     )
 
 
-@router.post("/parse-cv", response_model=CvParseResponse)
+@router.post(
+    "/parse-cv",
+    response_model=CvParseResponse,
+)
 async def parse_cv(request: CvParseRequest):
     """Parse CV using document text extraction + LLM structured extraction via Instructor."""
     import asyncio
@@ -788,11 +1048,44 @@ async def parse_cv(request: CvParseRequest):
         name: str = Field(default="", description="Full name")
         email: str = Field(default="", description="Email address")
         phone: str = Field(default="", description="Phone number")
-        skills: list[str] = Field(default_factory=list, description="Technical and soft skills")
-        education: list[dict] = Field(default_factory=list, description="Education history with keys: university, major, year, gpa")
-        experience: list[dict] = Field(default_factory=list, description="Work experience with keys: company, position, start, end, description")
-        certifications: list[dict] = Field(default_factory=list, description="Certifications with keys: name, issuer, year")
-        portfolio_urls: list[str] = Field(default_factory=list, description="Portfolio/professional URLs (GitHub, LinkedIn, Dribbble, Behance, etc.)")
+        summary: str = Field(default="", description="Professional summary or objective statement")
+        skills: list[str] = Field(
+            default_factory=list,
+            description=(
+                "ALL technical skills extracted from EVERY section: "
+                "certifications tech tags, project tech stacks, work experience descriptions, "
+                "education coursework, and any explicit skills section. "
+                "Include frameworks, languages, tools, platforms, algorithms, and ML model types."
+            ),
+        )
+        education: list[dict] = Field(
+            default_factory=list,
+            description="Education history. Each item: {university, major, year, gpa}",
+        )
+        experience: list[dict] = Field(
+            default_factory=list,
+            description="Work experience. Each item: {company, position, start, end, description}",
+        )
+        organizational_experience: list[dict] = Field(
+            default_factory=list,
+            description="Organizational/volunteer experience. Each item: {organization, role, start, end, description}",
+        )
+        projects: list[dict] = Field(
+            default_factory=list,
+            description="Personal/academic projects. Each item: {title, tech_stack, description, url}",
+        )
+        certifications: list[dict] = Field(
+            default_factory=list,
+            description="Certifications. Each item: {name, issuer, year}",
+        )
+        portfolio_urls: list[str] = Field(
+            default_factory=list,
+            description="Portfolio/professional URLs (GitHub, LinkedIn, Dribbble, Behance, etc.)",
+        )
+        years_of_experience: int | None = Field(
+            default=None,
+            description="Total years of professional work experience (integer, exclude internships if under 1 year)",
+        )
 
     raw_file_url = request.file_url or ""
     if raw_file_url.startswith(("http://", "https://")):
@@ -814,7 +1107,7 @@ async def parse_cv(request: CvParseRequest):
                     "CV download attempt %d failed: status=%d url=%s",
                     attempt + 1, res.status_code, file_url,
                 )
-        except httpx.HTTPError as e:
+        except Exception as e:
             logger.warning("CV download attempt %d errored: %s", attempt + 1, e)
         await asyncio.sleep(1)
 
@@ -875,19 +1168,29 @@ async def parse_cv(request: CvParseRequest):
         )
 
         extracted = client.chat.completions.create(
-            model="cv_parser",
+            model="cv_extraction",
             response_model=ExtractedCV,
             messages=[
                 {
                     "role": "system",
                     "content": (
-                        "Extract structured information from this CV/resume text. "
-                        "Be thorough and accurate. Extract all skills, education history, "
-                        "work experience, certifications, and portfolio URLs. "
+                        "You are an expert CV parser. Extract ALL structured information from this CV/resume text.\n\n"
+                        "CRITICAL — skills extraction rules:\n"
+                        "1. Scan EVERY section: certifications tech tags, project tech stacks (after '|' or in parentheses), "
+                        "work experience bullet points, education coursework, and any explicit skills section.\n"
+                        "2. Include: programming languages, frameworks, libraries, tools, platforms, cloud services, "
+                        "databases, ML algorithms (XGBoost, CatBoost, LightGBM, KNN, GNB, CNN, LSTM, etc.), "
+                        "MLOps tools (MLflow, Kubeflow, KServe, Feast), data tools (Tableau, R, Streamlit, Gradio), "
+                        "AI frameworks (LangChain, FAISS, Transformers, Hugging Face, LLM).\n"
+                        "3. Do NOT invent skills not mentioned in the text.\n"
+                        "4. Deduplicate — return each skill once.\n\n"
+                        "For organizational_experience: extract leadership roles in student orgs, volunteer work, committees.\n"
+                        "For projects: extract from 'Projects' section — each with title, tech stack list, short description, and any URL.\n"
+                        "For certifications: include the tech tags listed after the cert name (e.g. 'IBM AI Engineering | Python, PyTorch, TensorFlow').\n"
                         "For Indonesian CVs, handle both Indonesian and English content."
                     ),
                 },
-                {"role": "user", "content": cv_text[:8000]},
+                {"role": "user", "content": cv_text[:12000]},
             ],
             max_retries=2,
         )
@@ -896,12 +1199,15 @@ async def parse_cv(request: CvParseRequest):
             name=extracted.name,
             email=extracted.email,
             phone=extracted.phone,
+            summary=extracted.summary or None,
             skills=extracted.skills,
             education=extracted.education,
             experience=extracted.experience,
-            projects=[{"url": u} for u in extracted.portfolio_urls],
+            organizational_experience=extracted.organizational_experience,
+            projects=extracted.projects,
             certifications=extracted.certifications,
             portfolio_urls=extracted.portfolio_urls,
+            years_of_experience=extracted.years_of_experience,
         )
 
         # Confidence based on field completeness
@@ -923,10 +1229,19 @@ async def parse_cv(request: CvParseRequest):
             skills=result.skills,
             education=result.education,
             experience=result.experience,
-            projects=[{"url": u} for u in result.portfolio_urls],
+            projects=result.projects,
             portfolio_urls=result.portfolio_urls,
         )
         confidence = min(0.7, 0.3 + len(result.skills) * 0.04)
+
+    await publish_event(
+        "ai.cv.parsed",
+        {
+            "talentId": request.talent_id,
+            "confidenceScore": float(confidence),
+            "skillCount": len(parsed_data.skills or []),
+        },
+    )
 
     return CvParseResponse(
         talent_id=request.talent_id,
@@ -961,16 +1276,16 @@ The completeness score should reflect how much information is available for gene
 Return ONLY valid JSON, no markdown or extra text."""
 
 
-@router.post("/parse-spec", response_model=ParseSpecResponse)
-async def parse_spec(request: Request):
+@router.post(
+    "/parse-spec",
+    response_model=ParseSpecResponse,
+    dependencies=[Depends(require_service_auth)],
+)
+async def parse_spec(request: ParseSpecRequest):
     """Parse an uploaded specification document and extract project information."""
-    body = await request.json()
-    file_url = body.get("file_url", "")
-    file_type = body.get("file_type", "pdf")
-    notes = body.get("notes", "")
-
-    if not file_url:
-        raise HTTPException(status_code=400, detail="file_url required")
+    file_url = request.file_url
+    file_type = request.file_type
+    notes = request.notes
 
     # Download file
     file_bytes = None
@@ -993,7 +1308,7 @@ async def parse_spec(request: Request):
                     file_bytes = res.content
                 else:
                     logger.warning("Spec S3 download failed: status=%d", res.status_code)
-        except httpx.HTTPError as e:
+        except Exception as e:
             logger.warning("Spec S3 download errored: %s", e)
 
     if not file_bytes:
@@ -1065,12 +1380,17 @@ async def parse_spec(request: Request):
     )
 
 
-@router.post("/match-talents", response_model=MatchingResponse)
+@router.post(
+    "/match-talents",
+    response_model=MatchingResponse,
+    dependencies=[Depends(require_service_auth)],
+)
 async def match_talents(request: MatchingRequest):
     """Match talents to a project: delegate scoring to project-service rule-based recommender."""
     headers = {}
-    if INTERNAL_SERVICE_TOKEN:
-        headers["X-Service-Auth"] = INTERNAL_SERVICE_TOKEN
+    secret = _service_auth_secret()
+    if secret:
+        headers["X-Service-Auth"] = secret
 
     project_recommendations: list[dict] = []
     exploration_count = 0
@@ -1114,6 +1434,16 @@ async def match_talents(request: MatchingRequest):
             }
         )
 
+    await publish_event(
+        "ai.matching.completed",
+        {
+            "projectId": request.project_id,
+            "recommendationCount": len(recommendations),
+            "explorationCount": exploration_count,
+            "exploitationCount": exploitation_count,
+        },
+    )
+
     return MatchingResponse(
         project_id=request.project_id,
         recommendations=recommendations,
@@ -1122,25 +1452,28 @@ async def match_talents(request: MatchingRequest):
     )
 
 
-@router.post("/embed-document")
-async def embed_document(request: Request):
+class EmbedDocumentRequest(BaseModel):
+    documentId: str
+    documentType: Literal["brd", "prd"]
+    content: str | dict | list
+
+
+@router.post(
+    "/embed-document",
+    dependencies=[Depends(require_service_auth)],
+    responses={
+        500: {"description": "Embedding or persistence error"},
+        503: {"description": "Embedding service unavailable"},
+    },
+)
+async def embed_document(request: EmbedDocumentRequest):
     """Compute Gemini embedding for a BRD/PRD and persist it to the document row.
 
-    Body: {documentId: str, documentType: 'brd'|'prd', content: str|object}
     Internal endpoint -- expected to be called from project-service after approval.
     """
-    body = await request.json()
-    document_id = body.get("documentId") or body.get("document_id")
-    document_type = body.get("documentType") or body.get("document_type")
-    content = body.get("content")
-
-    if not document_id or document_type not in {"brd", "prd"}:
-        raise HTTPException(
-            status_code=400,
-            detail="documentId and documentType ('brd'|'prd') required",
-        )
-    if content is None:
-        raise HTTPException(status_code=400, detail="content required")
+    document_id = request.documentId
+    document_type = request.documentType
+    content = request.content
 
     if isinstance(content, dict | list):
         text_input = json.dumps(content, default=str)[:8000]

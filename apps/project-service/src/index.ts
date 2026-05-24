@@ -3,6 +3,7 @@ import { honoLogger } from '@kerjacus/logger'
 import { Scalar } from '@scalar/hono-api-reference'
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
+import { env } from './lib/env'
 import { correlationId } from './middleware/correlation-id'
 import { errorHandler } from './middleware/error-handler'
 import { generalRateLimit, strictRateLimit } from './middleware/rate-limit'
@@ -24,8 +25,9 @@ import { talentRoute } from './routes/talents'
 import { timeLogRoute } from './routes/time-logs'
 import { uploadRoute } from './routes/upload'
 import { workPackageRoute } from './routes/work-packages'
-import { startOutboxProcessor } from './services/outbox-worker'
-import { startScheduledJobs } from './services/scheduled-jobs'
+import { startInvoiceConsumer, stopInvoiceConsumer } from './services/invoice-consumer'
+import { startOutboxProcessor, stopOutboxProcessor } from './services/outbox-worker'
+import { startScheduledJobs, stopScheduledJobs } from './services/scheduled-jobs'
 
 const app = new Hono()
 
@@ -33,7 +35,7 @@ const app = new Hono()
 app.use(
   '*',
   cors({
-    origin: process.env.CORS_ORIGIN ?? 'http://localhost:5173',
+    origin: env.CORS_ORIGIN,
     credentials: true,
   }),
 )
@@ -109,12 +111,36 @@ app.route('/api/v1/upload', uploadRoute)
 app.route('/api/v1/activities', activityRoute)
 app.route('/api/v1', invoicesRoute)
 
-const port = Number(process.env.PORT) || 3002
+const port = env.PORT
 console.log(`Project service running on port ${port}`)
 
-// Start outbox worker and scheduled jobs
+// Start outbox worker, scheduled jobs, and invoice consumer
 startOutboxProcessor().catch(console.error)
 startScheduledJobs()
+startInvoiceConsumer().catch(console.error)
+
+// Graceful shutdown: drain the NATS connection and stop schedulers so in-flight
+// outbox publishes are flushed instead of dropped when the orchestrator kills us.
+let shuttingDown = false
+const shutdown = async (signal: string) => {
+  if (shuttingDown) return
+  shuttingDown = true
+  console.log(`[project-service] ${signal} received, shutting down`)
+  stopScheduledJobs()
+  try {
+    await stopInvoiceConsumer()
+  } catch (err) {
+    console.error('[project-service] invoice consumer stop error:', err)
+  }
+  try {
+    await stopOutboxProcessor()
+  } catch (err) {
+    console.error('[project-service] outbox stop error:', err)
+  }
+  process.exit(0)
+}
+process.on('SIGTERM', () => void shutdown('SIGTERM'))
+process.on('SIGINT', () => void shutdown('SIGINT'))
 
 export default {
   port,

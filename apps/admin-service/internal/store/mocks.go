@@ -52,6 +52,7 @@ type MockUserStore struct {
 	GetPlatformSettingsFn   func(ctx context.Context) ([]PlatformSetting, error)
 	GetPlatformSettingFn    func(ctx context.Context, key string) (*PlatformSetting, error)
 	UpsertPlatformSettingFn func(ctx context.Context, id, key string, value json.RawMessage, description *string, adminID string) (*PlatformSetting, error)
+	GetTalentDetailFn       func(ctx context.Context, userID string) (*TalentDetail, error)
 }
 
 func (m *MockUserStore) GetUsersList(ctx context.Context, f UserFilters) (*UserListResult, error) {
@@ -113,6 +114,117 @@ func (m *MockUserStore) GetPlatformSetting(ctx context.Context, key string) (*Pl
 func (m *MockUserStore) UpsertPlatformSetting(ctx context.Context, id, key string, value json.RawMessage, description *string, adminID string) (*PlatformSetting, error) {
 	if m.UpsertPlatformSettingFn != nil {
 		return m.UpsertPlatformSettingFn(ctx, id, key, value, description, adminID)
+	}
+	return nil, nil
+}
+
+func (m *MockUserStore) GetTalentDetail(ctx context.Context, userID string) (*TalentDetail, error) {
+	if m.GetTalentDetailFn != nil {
+		return m.GetTalentDetailFn(ctx, userID)
+	}
+	return nil, nil
+}
+
+// MockDLQStore implements DLQStoreInterface for testing.
+type MockDLQStore struct {
+	GetDLQListFn      func(ctx context.Context, f DLQFilters) (*DLQListResult, error)
+	GetDLQByIDFn      func(ctx context.Context, id string) (*DLQEvent, error)
+	MarkReprocessedFn func(ctx context.Context, id string) (*DLQEvent, error)
+}
+
+func (m *MockDLQStore) GetDLQList(ctx context.Context, f DLQFilters) (*DLQListResult, error) {
+	if m.GetDLQListFn != nil {
+		return m.GetDLQListFn(ctx, f)
+	}
+	return nil, nil
+}
+
+func (m *MockDLQStore) GetDLQByID(ctx context.Context, id string) (*DLQEvent, error) {
+	if m.GetDLQByIDFn != nil {
+		return m.GetDLQByIDFn(ctx, id)
+	}
+	return nil, nil
+}
+
+func (m *MockDLQStore) MarkReprocessed(ctx context.Context, id string) (*DLQEvent, error) {
+	if m.MarkReprocessedFn != nil {
+		return m.MarkReprocessedFn(ctx, id)
+	}
+	return nil, nil
+}
+
+// MockProjectStore implements ProjectStoreInterface for testing.
+type MockProjectStore struct {
+	GetProjectsListFn func(ctx context.Context, f ProjectFilters) (*ProjectListResult, error)
+	GetProjectByIDFn  func(ctx context.Context, id string) (*ProjectDetail, error)
+}
+
+func (m *MockProjectStore) GetProjectsList(ctx context.Context, f ProjectFilters) (*ProjectListResult, error) {
+	if m.GetProjectsListFn != nil {
+		return m.GetProjectsListFn(ctx, f)
+	}
+	return nil, nil
+}
+
+func (m *MockProjectStore) GetProjectByID(ctx context.Context, id string) (*ProjectDetail, error) {
+	if m.GetProjectByIDFn != nil {
+		return m.GetProjectByIDFn(ctx, id)
+	}
+	return nil, nil
+}
+
+// MockFinanceStore implements FinanceStoreInterface for testing.
+type MockFinanceStore struct {
+	GetSummaryFn          func(ctx context.Context) (*FinanceSummary, error)
+	GetEscrowByProjectFn  func(ctx context.Context, limit int) ([]EscrowProjectRow, error)
+	GetTransactionsListFn func(ctx context.Context, f TransactionFilters) (*TransactionListResult, error)
+}
+
+func (m *MockFinanceStore) GetSummary(ctx context.Context) (*FinanceSummary, error) {
+	if m.GetSummaryFn != nil {
+		return m.GetSummaryFn(ctx)
+	}
+	return nil, nil
+}
+
+func (m *MockFinanceStore) GetEscrowByProject(ctx context.Context, limit int) ([]EscrowProjectRow, error) {
+	if m.GetEscrowByProjectFn != nil {
+		return m.GetEscrowByProjectFn(ctx, limit)
+	}
+	return nil, nil
+}
+
+func (m *MockFinanceStore) GetTransactionsList(ctx context.Context, f TransactionFilters) (*TransactionListResult, error) {
+	if m.GetTransactionsListFn != nil {
+		return m.GetTransactionsListFn(ctx, f)
+	}
+	return nil, nil
+}
+
+// MockDisputeStore implements DisputeStoreInterface for testing.
+type MockDisputeStore struct {
+	GetDisputesListFn func(ctx context.Context, f DisputeFilters) (*DisputeListResult, error)
+	GetStatusCountsFn func(ctx context.Context) (map[string]int64, error)
+	GetDisputeByIDFn  func(ctx context.Context, id string) (*DisputeDetail, error)
+}
+
+func (m *MockDisputeStore) GetDisputesList(ctx context.Context, f DisputeFilters) (*DisputeListResult, error) {
+	if m.GetDisputesListFn != nil {
+		return m.GetDisputesListFn(ctx, f)
+	}
+	return nil, nil
+}
+
+func (m *MockDisputeStore) GetStatusCounts(ctx context.Context) (map[string]int64, error) {
+	if m.GetStatusCountsFn != nil {
+		return m.GetStatusCountsFn(ctx)
+	}
+	return nil, nil
+}
+
+func (m *MockDisputeStore) GetDisputeByID(ctx context.Context, id string) (*DisputeDetail, error) {
+	if m.GetDisputeByIDFn != nil {
+		return m.GetDisputeByIDFn(ctx, id)
 	}
 	return nil, nil
 }

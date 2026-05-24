@@ -5656,6 +5656,11 @@ async function seed() {
     { key: 'free_revision_rounds', value: 2, description: 'Jumlah revisi gratis per milestone' },
     { key: 'max_team_size', value: 8, description: 'Maksimum talent per proyek' },
     {
+      key: 'matching_weights',
+      value: { skill_match: 30, pemerataan: 35, track_record: 20, rating: 15 },
+      description: 'Bobot algoritma matching (skill/pemerataan/track/rating), total = 100',
+    },
+    {
       key: 'matching_sla_single_hours',
       value: 72,
       description: 'SLA matching single worker (jam)',
@@ -6053,15 +6058,33 @@ async function seed() {
   // 36. OUTBOX EVENTS
   // =====================================================================
   console.log('  Seeding outbox events...')
-  const outboxData = [
+  const outboxData: {
+    agg: string
+    aggId: string
+    evt: string
+    pub: boolean
+    payload?: Record<string, unknown>
+  }[] = [
     { agg: 'project', aggId: p1Id, evt: 'project.status.changed', pub: true },
     { agg: 'milestone', aggId: ms1Id, evt: 'milestone.approved', pub: true },
     { agg: 'payment', aggId: txn2Id, evt: 'payment.released', pub: true },
     { agg: 'project', aggId: p23Id, evt: 'project.status.changed', pub: true },
     { agg: 'worker', aggId: talent4Id, evt: 'worker.registered', pub: false },
-    { agg: 'milestone', aggId: ms24Id, evt: 'milestone.submitted', pub: false },
+    {
+      agg: 'milestone',
+      aggId: ms24Id,
+      evt: 'milestone.submitted',
+      pub: false,
+      payload: { milestoneId: ms24Id, projectId: p24Id, talentId: talent3Id },
+    },
     { agg: 'project', aggId: p9Id, evt: 'project.status.changed', pub: true },
-    { agg: 'milestone', aggId: ms6Id, evt: 'milestone.submitted', pub: false },
+    {
+      agg: 'milestone',
+      aggId: ms6Id,
+      evt: 'milestone.submitted',
+      pub: false,
+      payload: { milestoneId: ms6Id, projectId: p2Id, talentId: talent5Id },
+    },
   ]
   for (const o of outboxData) {
     await db
@@ -6071,7 +6094,7 @@ async function seed() {
         aggregateType: o.agg,
         aggregateId: o.aggId,
         eventType: o.evt,
-        payload: { aggregateId: o.aggId, seed: true },
+        payload: o.payload ?? { aggregateId: o.aggId, seed: true },
         published: o.pub,
         publishedAt: o.pub ? new Date() : null,
       })

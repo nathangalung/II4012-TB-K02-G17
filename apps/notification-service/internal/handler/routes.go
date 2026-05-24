@@ -26,23 +26,24 @@ func (h *Handler) SetCentrifugoTokenSecret(secret string) {
 	h.centrifugoTokenSecret = secret
 }
 
-func (h *Handler) Register(app *fiber.App) {
+func (h *Handler) Register(app *fiber.App, serviceMiddleware fiber.Handler) {
 	app.Get("/health", h.health)
-	app.Get("/health/ready", h.ready)
 
-	// Internal endpoints — called by other services (no session required)
-	internal := app.Group("/api/v1/notifications")
-	internal.Post("/", h.createNotification)
+	// Internal endpoint — route-level middleware to avoid bleeding into user routes.
+	// Fiber's Group(prefix, middleware) registers middleware as path-level USE, which
+	// would apply to ALL routes under the prefix including user-facing GET routes.
+	app.Post("/api/v1/notifications", serviceMiddleware, h.createNotification)
 }
 
 // RegisterWithAuth registers user-facing routes with session auth middleware.
 func (h *Handler) RegisterWithAuth(app *fiber.App, authMiddleware fiber.Handler) {
-	api := app.Group("/api/v1/notifications", authMiddleware)
-	api.Get("/", h.listNotifications)
-	api.Patch("/:id/read", h.markRead)
-	api.Patch("/read-all", h.markAllRead)
-	api.Get("/unread-count", h.unreadCount)
-	api.Get("/ws-token", h.wsToken)
+	// Don't pass authMiddleware to Group() — same path-level bleeding issue.
+	// Apply per-route instead.
+	app.Get("/api/v1/notifications", authMiddleware, h.listNotifications)
+	app.Patch("/api/v1/notifications/:id/read", authMiddleware, h.markRead)
+	app.Patch("/api/v1/notifications/read-all", authMiddleware, h.markAllRead)
+	app.Get("/api/v1/notifications/unread-count", authMiddleware, h.unreadCount)
+	app.Get("/api/v1/notifications/ws-token", authMiddleware, h.wsToken)
 }
 
 // GET /api/v1/notifications/ws-token
@@ -83,11 +84,6 @@ func (h *Handler) health(c *fiber.Ctx) error {
 		"service": "notification-service",
 		"uptime":  time.Since(h.startAt).Seconds(),
 	})
-}
-
-// GET /health/ready
-func (h *Handler) ready(c *fiber.Ctx) error {
-	return c.JSON(fiber.Map{"status": "ready"})
 }
 
 type apiResponse struct {

@@ -24,61 +24,74 @@ export function useScopingChat(projectId: string) {
   })
   const messageIdCounter = useRef(0)
 
-  // Load existing messages from backend
+  // Load existing messages + form-driven completeness floor from backend
   useEffect(() => {
-    async function loadMessages() {
+    async function loadInitialState() {
+      // Form-driven completeness floor (ground truth from intake form)
+      let formFloor = 0
       try {
-        // First find the ai_scoping conversation for this project
+        const statusRes = await fetch(apiUrl(`/api/v1/projects/${projectId}/scoping-status`), {
+          credentials: 'include',
+        })
+        if (statusRes.ok) {
+          const statusData = await statusRes.json()
+          if (typeof statusData?.data?.formFloor === 'number') {
+            formFloor = statusData.data.formFloor
+          }
+        }
+      } catch {
+        // Floor stays 0 if unreachable; AI scores still drive percentage.
+      }
+
+      // Existing scoping conversation messages
+      let loaded: ChatMessage[] = []
+      try {
         const convRes = await fetch(apiUrl(`/api/v1/chat/conversations`), {
           credentials: 'include',
           headers: { 'Content-Type': 'application/json' },
         })
-        if (!convRes.ok) return
-        const convData = await convRes.json()
-        const conversations = convData?.data ?? []
-        const scopingConv = conversations.find(
-          (c: { projectId: string; type: string }) =>
-            c.projectId === projectId && c.type === 'ai_scoping',
-        )
-        if (!scopingConv) return
-
-        // Load messages for this conversation
-        const msgRes = await fetch(
-          apiUrl(`/api/v1/chat/conversations/${scopingConv.id}/messages?pageSize=100`),
-          { credentials: 'include' },
-        )
-        if (!msgRes.ok) return
-        const msgData = await msgRes.json()
-        const items = msgData?.data?.items ?? []
-
-        if (items.length > 0) {
-          const loaded: ChatMessage[] = items
-            .sort(
-              (a: { createdAt: string }, b: { createdAt: string }) =>
-                new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
+        if (convRes.ok) {
+          const convData = await convRes.json()
+          const conversations = convData?.data ?? []
+          const scopingConv = conversations.find(
+            (c: { projectId: string; type: string }) =>
+              c.projectId === projectId && c.type === 'ai_scoping',
+          )
+          if (scopingConv) {
+            const msgRes = await fetch(
+              apiUrl(`/api/v1/chat/conversations/${scopingConv.id}/messages?pageSize=100`),
+              { credentials: 'include' },
             )
-            .map((m: { id: string; senderType: string; content: string; createdAt: string }) => ({
-              id: m.id,
-              senderType: m.senderType as 'user' | 'ai' | 'system',
-              content: m.content,
-              createdAt: m.createdAt,
-            }))
-
-          // Calculate completeness from loaded messages
-          const userCount = loaded.filter((m) => m.senderType === 'user').length
-          const loadedCompleteness = Math.min(100, userCount * 18)
-
-          setState((prev) => ({
-            ...prev,
-            messages: loaded,
-            completeness: loadedCompleteness,
-          }))
+            if (msgRes.ok) {
+              const msgData = await msgRes.json()
+              const items = msgData?.data?.items ?? []
+              loaded = items
+                .sort(
+                  (a: { createdAt: string }, b: { createdAt: string }) =>
+                    new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
+                )
+                .map(
+                  (m: { id: string; senderType: string; content: string; createdAt: string }) => ({
+                    id: m.id,
+                    senderType: m.senderType as 'user' | 'ai' | 'system',
+                    content: m.content,
+                    createdAt: m.createdAt,
+                  }),
+                )
+            }
+          }
         }
       } catch {
-        // Silently fail - messages will start fresh
+        // Messages stay empty; floor still applies.
       }
+
+      setState((prev) => ({
+        ...prev,
+        messages: loaded,
+        completeness: Math.max(prev.completeness, formFloor),
+      }))
     }
-    loadMessages()
+    loadInitialState()
   }, [projectId])
 
   const generateId = useCallback(() => {
@@ -176,9 +189,7 @@ export function useScopingChat(projectId: string) {
         setState((prev) => ({
           ...prev,
           messages: prev.messages.map((m) =>
-            m.id === aiMessageId
-              ? { ...m, content: accumulated || 'Terima kasih atas informasinya.' }
-              : m,
+            m.id === aiMessageId ? { ...m, content: accumulated } : m,
           ),
           completeness: Math.min(100, finalCompleteness),
           isLoading: false,
@@ -187,51 +198,12 @@ export function useScopingChat(projectId: string) {
         setState((prev) => ({
           ...prev,
           messages: prev.messages.filter((m) => m.id !== aiMessageId),
+          isLoading: false,
+          error: err instanceof Error ? err.message : 'Failed to send message',
         }))
-        // Only use simulated responses in dev mode when the backend is unreachable.
-        // In production, surface the error to the user instead of silently faking AI responses.
-        if (import.meta.env.DEV) {
-          const simulatedResponses = [
-            'Terima kasih atas informasinya. Bisa ceritakan lebih detail tentang target pengguna aplikasi ini?',
-            'Bagus! Apakah ada integrasi dengan sistem yang sudah ada? Misalnya payment gateway atau API pihak ketiga?',
-            'Dipahami. Untuk fitur utamanya, mana yang menjadi prioritas tertinggi (must-have) dan mana yang bisa ditambahkan nanti (nice-to-have)?',
-            "Apakah ada referensi aplikasi sejenis yang bisa dijadikan acuan? Misalnya 'seperti Tokopedia tapi untuk X'.",
-            "Baik, informasi sudah cukup lengkap. Saya siap membuatkan BRD untuk proyek Anda. Silakan klik tombol 'Generate BRD' jika sudah siap.",
-          ]
-
-          const responseIndex = Math.min(
-            Math.floor(state.messages.filter((m) => m.senderType === 'user').length),
-            simulatedResponses.length - 1,
-          )
-
-          const aiMessage: ChatMessage = {
-            id: generateId(),
-            senderType: 'ai',
-            content: simulatedResponses[responseIndex],
-            createdAt: new Date().toISOString(),
-          }
-
-          const userMsgCount = state.messages.filter((m) => m.senderType === 'user').length + 1
-          const newCompleteness = Math.min(100, userMsgCount * 18)
-
-          setState((prev) => ({
-            ...prev,
-            messages: [...prev.messages, aiMessage],
-            completeness: newCompleteness,
-            isLoading: false,
-            error: null,
-          }))
-        } else {
-          const message = err instanceof Error ? err.message : 'Failed to send message'
-          setState((prev) => ({
-            ...prev,
-            isLoading: false,
-            error: message,
-          }))
-        }
       }
     },
-    [projectId, state.isLoading, state.completeness, state.messages, generateId],
+    [projectId, state.isLoading, state.completeness, generateId],
   )
 
   const addSystemMessage = useCallback(

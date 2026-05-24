@@ -27,6 +27,7 @@ vi.mock('@kerjacus/db', () => {
 
 vi.mock('@nats-io/transport-node', () => ({
   connect: vi.fn().mockResolvedValue({
+    drain: vi.fn().mockResolvedValue(undefined),
     close: vi.fn(),
   }),
 }))
@@ -65,24 +66,24 @@ describe('outbox-worker', () => {
   })
 
   describe('stopOutboxProcessor', () => {
-    it('closes NATS connection and stops', async () => {
+    it('drains NATS connection and stops', async () => {
       // Start first to establish connection
       await startOutboxProcessor()
 
       // Then stop
       await stopOutboxProcessor()
 
-      // Should close NATS connection
+      // Should drain (preferred over close — flushes pending publishes)
       const { connect } = await import('@nats-io/transport-node')
-      const mockConn = await vi.mocked(connect).mock.results[0]?.value
+      const mockConn = await (connect as ReturnType<typeof vi.fn>).mock.results[0]?.value
       if (mockConn) {
-        expect(mockConn.close).toHaveBeenCalled()
+        expect(mockConn.drain).toHaveBeenCalled()
       }
     })
 
     it('handles stop when not started gracefully', async () => {
       // Should not throw even if never started
-      await expect(stopOutboxProcessor()).resolves.not.toThrow()
+      await stopOutboxProcessor()
     })
   })
 })

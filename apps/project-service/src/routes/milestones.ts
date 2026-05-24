@@ -1,7 +1,7 @@
 import {
   getDb,
+  milestoneFiles,
   milestones as milestonesTable,
-  outboxEvents,
   projects,
   talentProfiles,
 } from '@kerjacus/db'
@@ -11,6 +11,7 @@ import { eq } from 'drizzle-orm'
 import { Hono } from 'hono'
 import { uuidv7 } from 'uuidv7'
 import { z } from 'zod'
+import { appendOutboxEvent } from '../lib/outbox'
 import {
   getTemporalClient,
   milestoneAutoReleaseWorkflowId,
@@ -24,7 +25,6 @@ import {
   milestoneApprovedSignal,
   milestoneAutoReleaseWorkflow,
 } from '../workflows/milestoneAutoRelease'
-import { getInvoiceService } from './invoices'
 
 const logger = createLogger('project-service:milestones')
 
@@ -114,8 +114,7 @@ milestonesRoute.post('/projects/:projectId/milestones', async (c) => {
   })
 
   // Emit outbox event
-  await db.insert(outboxEvents).values({
-    id: uuidv7(),
+  await appendOutboxEvent(db, {
     aggregateType: 'milestone',
     aggregateId: milestone.id,
     eventType: 'milestone.created',
@@ -197,15 +196,15 @@ milestonesRoute.patch('/milestones/:id/status', async (c) => {
   const service = getService()
   const milestone = await service.updateMilestoneStatus(id, parsed.data.status as MilestoneStatus)
 
-  // Auto-generate invoice PDF on milestone approval (fire-and-forget).
-  // TODO: move to outbox event for reliability.
+  // Invoice generation via outbox. project-service consumes the event below
+  // and runs the actual PDF render. Outbox commit gives us durability so a
+  // crash here cannot drop the invoice work for an approved milestone.
   if (parsed.data.status === 'approved') {
-    const invoiceService = getInvoiceService()
-    Promise.all([
-      invoiceService.generateInvoice(id, { isAdminCopy: false }),
-      invoiceService.generateInvoice(id, { isAdminCopy: true }),
-    ]).catch((err) => {
-      logger.warn({ err, milestoneId: id }, 'invoice generation failed')
+    await appendOutboxEvent(db, {
+      aggregateType: 'milestone',
+      aggregateId: id,
+      eventType: 'milestone.invoice_requested',
+      payload: { milestoneId: id, projectId: ms.projectId },
     })
   }
 
@@ -219,6 +218,72 @@ milestonesRoute.patch('/milestones/:id/status', async (c) => {
     success: true,
     data: milestone,
   })
+})
+
+const addMilestoneFileSchema = z.object({
+  fileName: z.string().min(1).max(255),
+  fileUrl: z.string().min(1),
+  fileSize: z.number().int().positive(),
+  mimeType: z.string().min(1).max(100),
+})
+
+// GET /milestones/:id/files - list attachments for a milestone
+milestonesRoute.get('/milestones/:id/files', async (c) => {
+  getAuthUser(c)
+  const id = c.req.param('id')
+  const db = getDb()
+
+  const [ms] = await db
+    .select({ id: milestonesTable.id })
+    .from(milestonesTable)
+    .where(eq(milestonesTable.id, id))
+    .limit(1)
+  if (!ms) {
+    throw new AppError('NOT_FOUND', 'Milestone not found')
+  }
+
+  const files = await db.select().from(milestoneFiles).where(eq(milestoneFiles.milestoneId, id))
+
+  return c.json({ success: true, data: files })
+})
+
+// POST /milestones/:id/files - record a file attachment after S3 upload
+milestonesRoute.post('/milestones/:id/files', async (c) => {
+  const user = getAuthUser(c)
+  const id = c.req.param('id')
+  const body = await c.req.json()
+
+  const parsed = addMilestoneFileSchema.safeParse(body)
+  if (!parsed.success) {
+    throw new AppError('VALIDATION_ERROR', 'Invalid file data', {
+      issues: z.flattenError(parsed.error).fieldErrors,
+    })
+  }
+
+  const db = getDb()
+  const [ms] = await db
+    .select({ id: milestonesTable.id })
+    .from(milestonesTable)
+    .where(eq(milestonesTable.id, id))
+    .limit(1)
+  if (!ms) {
+    throw new AppError('NOT_FOUND', 'Milestone not found')
+  }
+
+  const [file] = await db
+    .insert(milestoneFiles)
+    .values({
+      id: uuidv7(),
+      milestoneId: id,
+      fileName: parsed.data.fileName,
+      fileUrl: parsed.data.fileUrl,
+      fileSize: parsed.data.fileSize,
+      mimeType: parsed.data.mimeType,
+      uploadedBy: user.id,
+    })
+    .returning()
+
+  return c.json({ success: true, data: file }, 201)
 })
 
 /** Side-effect: start or signal milestone auto-release workflow based on new status. */

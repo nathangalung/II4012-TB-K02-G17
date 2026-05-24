@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class HealthResponse(BaseModel):
@@ -51,11 +51,32 @@ class GenerateBrdRequest(BaseModel):
     budget_max: int | None = None
     timeline_days: int | None = None
 
+    @field_validator("timeline_days", "budget_min", "budget_max", mode="before")
+    @classmethod
+    def _reject_bool(cls, v: object) -> object:
+        if isinstance(v, bool):
+            raise ValueError("must be an integer, not a boolean")
+        return v
+
+
+class BrdSectionScore(BaseModel):
+    section: str  # Template section code: B, D, E, H, K, L, M
+    label: str
+    score: int = Field(ge=0, le=100)
+    reason: str = ""
+
+
+class BrdTemplateScore(BaseModel):
+    """Completeness score of generated BRD against template sections (A-N)."""
+    overall: int = Field(ge=0, le=100)
+    sections: list[BrdSectionScore] = []
+
 
 class GenerateBrdResponse(BaseModel):
     brd: BrdDocument
     tokens_used: int
     model: str
+    template_score: BrdTemplateScore = Field(default_factory=BrdTemplateScore)
 
 
 class CvParseRequest(BaseModel):
@@ -68,12 +89,15 @@ class CvParsedData(BaseModel):
     name: str | None = None
     email: str | None = None
     phone: str | None = None
+    summary: str | None = None
     education: list[dict] = []
     experience: list[dict] = []
+    organizational_experience: list[dict] = []
     projects: list[dict] = []
     skills: list[str] = []
     certifications: list[dict] = []
     portfolio_urls: list[str] = []
+    years_of_experience: int | None = None
 
 
 class CvParseResponse(BaseModel):
@@ -133,6 +157,13 @@ class GeneratePrdRequest(BaseModel):
     budget_max: int | None = None
     timeline_days: int | None = None
 
+    @field_validator("timeline_days", "budget_min", "budget_max", mode="before")
+    @classmethod
+    def _reject_bool(cls, v: object) -> object:
+        if isinstance(v, bool):
+            raise ValueError("must be an integer, not a boolean")
+        return v
+
 
 class GeneratePrdResponse(BaseModel):
     prd: PrdDocument
@@ -141,7 +172,7 @@ class GeneratePrdResponse(BaseModel):
 
 
 class ParseSpecRequest(BaseModel):
-    file_url: str
+    file_url: str = Field(min_length=1)
     file_type: str = "pdf"
     notes: str = ""
 
@@ -167,6 +198,13 @@ class MatchingRequest(BaseModel):
     required_skills: list[str]
     budget: int | None = None
     timeline_days: int | None = None
+
+    @field_validator("timeline_days", "budget", mode="before")
+    @classmethod
+    def _reject_bool(cls, v: object) -> object:
+        if isinstance(v, bool):
+            raise ValueError("must be an integer, not a boolean")
+        return v
 
 
 class TalentScore(BaseModel):

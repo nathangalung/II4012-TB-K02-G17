@@ -38,7 +38,9 @@ func parseResponse(t *testing.T, resp *io.ReadCloser) apiResponseBody {
 
 func newTestApp(h *Handler) *fiber.App {
 	app := fiber.New()
-	h.Register(app)
+	// Pass-through middleware for tests — real ServiceOnly gating lives in middleware pkg
+	passThrough := func(c *fiber.Ctx) error { return c.Next() }
+	h.Register(app, passThrough)
 
 	authMiddleware := func(c *fiber.Ctx) error {
 		userID := c.Get("X-User-ID")
@@ -76,19 +78,8 @@ func TestHealth(t *testing.T) {
 	}
 }
 
-func TestHealthReady(t *testing.T) {
-	h := New(&store.MockStore{})
-	app := newTestApp(h)
-
-	req := httptest.NewRequest("GET", "/health/ready", nil)
-	resp, err := app.Test(req)
-	if err != nil {
-		t.Fatalf("test failed: %v", err)
-	}
-	if resp.StatusCode != fiber.StatusOK {
-		t.Errorf("status = %d, want %d", resp.StatusCode, fiber.StatusOK)
-	}
-}
+// Readiness probe is wired in main.go (needs live DB pool and NATS consumer),
+// so it's covered by integration/runtime checks, not this handler unit suite.
 
 // --- Auth required tests ---
 

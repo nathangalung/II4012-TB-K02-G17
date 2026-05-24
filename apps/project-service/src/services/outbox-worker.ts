@@ -1,17 +1,26 @@
 import { deadLetterEvents, getDb, outboxEvents } from '@kerjacus/db'
+import {
+  injectNatsTraceContext,
+  type NatsHeaderCarrier,
+  restoreTraceContext,
+} from '@kerjacus/logger'
 import { type JetStreamClient, jetstream } from '@nats-io/jetstream'
-import { connect, type NatsConnection } from '@nats-io/transport-node'
+import { connect, headers, type NatsConnection } from '@nats-io/transport-node'
+import { context, isSpanContextValid, SpanKind, SpanStatusCode, trace } from '@opentelemetry/api'
 import { and, eq, lt } from 'drizzle-orm'
 import { uuidv7 } from 'uuidv7'
+import { env } from '../lib/env'
+
+const tracer = trace.getTracer('project-service-outbox')
 
 let natsConn: NatsConnection | null = null
 let js: JetStreamClient | null = null
 let running = false
+let pollLoop: Promise<void> | null = null
 
 async function connectNats(): Promise<void> {
-  const url = process.env.NATS_URL || 'nats://localhost:4222'
   try {
-    natsConn = await connect({ servers: url })
+    natsConn = await connect({ servers: env.NATS_URL })
     js = jetstream(natsConn)
     console.log('[Outbox] Connected to NATS')
   } catch (err) {
@@ -36,15 +45,49 @@ async function pollAndPublish(): Promise<number> {
 
   for (const event of events) {
     try {
-      const envelope = {
-        id: event.id,
-        type: event.eventType,
-        source: 'project-service',
-        timestamp: (event.createdAt ?? new Date()).toISOString(),
-        data: event.payload,
-      }
-      await js.publish(event.eventType, JSON.stringify(envelope), {
-        msgID: event.id,
+      const parentCtx = restoreTraceContext(event.traceContext as Record<string, string> | null)
+      await context.with(parentCtx, async () => {
+        await tracer.startActiveSpan(
+          `nats.publish ${event.eventType}`,
+          {
+            kind: SpanKind.PRODUCER,
+            attributes: {
+              'messaging.system': 'nats',
+              'messaging.destination.name': event.eventType,
+              'messaging.message.id': event.id,
+              'messaging.operation': 'publish',
+            },
+          },
+          async (span) => {
+            try {
+              // correlationId = trace_id of this publish span. Because parent
+              // context was restored from outbox row, this id ties the event
+              // back to the original request that wrote the row.
+              const spanCtx = span.spanContext()
+              const correlationId = isSpanContextValid(spanCtx) ? spanCtx.traceId : undefined
+              const envelope = {
+                id: event.id,
+                type: event.eventType,
+                source: 'project-service',
+                timestamp: (event.createdAt ?? new Date()).toISOString(),
+                ...(correlationId ? { correlationId } : {}),
+                data: event.payload,
+              }
+              const hdr = headers()
+              injectNatsTraceContext(hdr as unknown as NatsHeaderCarrier)
+              // biome-ignore lint/style/noNonNullAssertion: js is checked above
+              await js!.publish(event.eventType, JSON.stringify(envelope), {
+                msgID: event.id,
+                headers: hdr,
+              })
+            } catch (err) {
+              span.setStatus({ code: SpanStatusCode.ERROR, message: String(err) })
+              throw err
+            } finally {
+              span.end()
+            }
+          },
+        )
       })
 
       await db
@@ -58,12 +101,12 @@ async function pollAndPublish(): Promise<number> {
       const errMsg = err instanceof Error ? err.message : String(err)
 
       if (retryCount >= 3) {
-        // Move to dead letter
         await db.insert(deadLetterEvents).values({
           id: uuidv7(),
           originalEventId: event.id,
           eventType: event.eventType,
           payload: event.payload,
+          traceContext: event.traceContext as never,
           consumerService: 'outbox-processor',
           errorMessage: errMsg,
           retryCount,
@@ -101,13 +144,37 @@ export async function startOutboxProcessor(): Promise<void> {
     }
   }
 
-  poll()
+  pollLoop = poll()
 }
 
 export async function stopOutboxProcessor(): Promise<void> {
   running = false
+
+  // Let any in-flight pollAndPublish finish before draining the connection,
+  // otherwise mid-publish events can be dropped without DB ack.
+  if (pollLoop) {
+    try {
+      await pollLoop
+    } catch (err) {
+      console.error('[Outbox] Poll loop exited with error:', err)
+    }
+    pollLoop = null
+  }
+
   if (natsConn) {
-    await natsConn.close()
+    // drain() flushes pending publishes and closes the connection — preferred
+    // over close() which drops in-flight messages. Fall back to close() if the
+    // drain itself errors (e.g. server already gone).
+    try {
+      await natsConn.drain()
+    } catch (err) {
+      console.error('[Outbox] NATS drain error, forcing close:', err)
+      try {
+        await natsConn.close()
+      } catch {
+        // already closed
+      }
+    }
     natsConn = null
     js = null
   }

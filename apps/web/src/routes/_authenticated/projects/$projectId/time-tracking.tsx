@@ -54,7 +54,7 @@ function useTimeLogs(projectId: string) {
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
       })
-      if (!res.ok) return []
+      if (!res.ok) throw new Error(`time logs fetch ${res.status}`)
       const json: ApiResponse<ApiTimeLog[]> = await res.json()
       if (!json.success || !json.data) return []
 
@@ -79,7 +79,6 @@ function useCreateTimeLog(projectId: string) {
   return useMutation({
     mutationFn: async (data: {
       taskId: string
-      talentId: string
       startedAt: string
       endedAt?: string
       durationMinutes?: number
@@ -180,9 +179,15 @@ function formatShortDate(dateStr: string): string {
 
 function TimeTrackingPage() {
   const { t } = useTranslation('project')
+  const { t: tc } = useTranslation('common')
   const { projectId } = Route.useParams()
   const { data: project, isLoading: projectLoading } = useProject(projectId)
-  const { data: timeLogs = [], isLoading: timeLogsLoading } = useTimeLogs(projectId)
+  const {
+    data: timeLogs = [],
+    isLoading: timeLogsLoading,
+    isError: timeLogsError,
+    refetch: refetchTimeLogs,
+  } = useTimeLogs(projectId)
   const { data: summary = [] } = useTimeLogSummary(projectId)
   const createTimeLog = useCreateTimeLog(projectId)
   const stopTimerMutation = useStopTimer(projectId)
@@ -251,7 +256,6 @@ function TimeTrackingPage() {
     createTimeLog.mutate(
       {
         taskId: timerTask,
-        talentId: 'current-user', // placeholder, backend should resolve from session
         startedAt: now,
         description: timerDescription || undefined,
       },
@@ -281,7 +285,6 @@ function TimeTrackingPage() {
       const durationMinutes = Math.max(1, Math.round(timerSeconds / 60))
       createTimeLog.mutate({
         taskId: timerTask,
-        talentId: 'current-user',
         startedAt: timerStartedAt,
         endedAt,
         durationMinutes,
@@ -316,7 +319,6 @@ function TimeTrackingPage() {
     createTimeLog.mutate(
       {
         taskId: manualTask,
-        talentId: 'current-user',
         startedAt,
         endedAt,
         durationMinutes: totalMinutes,
@@ -360,6 +362,21 @@ function TimeTrackingPage() {
     return (
       <div className="flex min-h-[60vh] items-center justify-center p-6 bg-surface">
         <Loader2 className="h-8 w-8 animate-spin text-success-600" />
+      </div>
+    )
+  }
+
+  if (timeLogsError) {
+    return (
+      <div className="flex min-h-[60vh] flex-col items-center justify-center gap-3 p-6 bg-surface">
+        <p className="text-sm text-on-surface-muted">{tc('error_loading')}</p>
+        <button
+          type="button"
+          onClick={() => refetchTimeLogs()}
+          className="rounded-lg bg-primary-600 px-5 py-2 text-sm font-semibold text-white hover:bg-primary-700"
+        >
+          {tc('retry')}
+        </button>
       </div>
     )
   }

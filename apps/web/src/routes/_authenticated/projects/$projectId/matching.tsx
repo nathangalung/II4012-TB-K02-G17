@@ -1,6 +1,6 @@
 import type { ApiResponse } from '@kerjacus/shared'
 import { useQuery } from '@tanstack/react-query'
-import { createFileRoute, Link } from '@tanstack/react-router'
+import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 import {
   ArrowLeft,
   Briefcase,
@@ -15,7 +15,7 @@ import {
 } from 'lucide-react'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { useProject } from '@/hooks/use-projects'
+import { useConfirmMatching, useProject } from '@/hooks/use-projects'
 import { apiUrl } from '@/lib/api'
 import { cn } from '@/lib/utils'
 
@@ -55,6 +55,25 @@ type MatchingApiResult = {
   exploitationCount: number
 }
 
+type TalentProfile = {
+  id: string
+  bio: string | null
+  yearsOfExperience: number | null
+  educationUniversity: string | null
+  educationMajor: string | null
+  availabilityStatus: string
+  domainExpertise: string[] | null
+  totalProjectsCompleted: number
+  totalProjectsActive: number
+}
+
+type TalentSkillRow = {
+  skillName: string
+  skillCategory: string
+  proficiencyLevel: string
+  isPrimary: boolean
+}
+
 function useMatchingRecommendations(projectId: string, requiredSkills: string[]) {
   return useQuery({
     queryKey: ['matching-recommendations', projectId],
@@ -71,20 +90,47 @@ function useMatchingRecommendations(projectId: string, requiredSkills: string[])
       const json: ApiResponse<MatchingApiResult> = await res.json()
       if (!json.success || !json.data) return []
 
-      return json.data.recommendations.map(
-        (rec: MatchingApiRecommendation, index: number): TalentRecommendation => ({
+      const recs = json.data.recommendations
+
+      const enriched = await Promise.all(
+        recs.map(async (rec) => {
+          const [profileRes, skillsRes] = await Promise.all([
+            fetch(apiUrl(`/api/v1/talents/${rec.talentId}`), { credentials: 'include' }),
+            fetch(apiUrl(`/api/v1/talents/${rec.talentId}/skills`), { credentials: 'include' }),
+          ])
+
+          const profileJson: ApiResponse<TalentProfile> = profileRes.ok
+            ? await profileRes.json()
+            : { success: false }
+          const skillsJson: ApiResponse<TalentSkillRow[]> = skillsRes.ok
+            ? await skillsRes.json()
+            : { success: false }
+
+          const profile = profileJson.success ? profileJson.data : null
+          const skillRows = skillsJson.success ? (skillsJson.data ?? []) : []
+
+          return { rec, profile, skillRows }
+        }),
+      )
+
+      return enriched.map(
+        ({ rec, profile, skillRows }, index): TalentRecommendation => ({
           id: rec.talentId,
           label: `Talenta #${index + 1}`,
           score: rec.score,
           skillMatch: rec.skillMatch,
-          experience: '-',
-          completedProjects: 0,
-          skills: [],
-          education: '-',
+          experience:
+            profile?.yearsOfExperience != null ? `${profile.yearsOfExperience} tahun` : '-',
+          completedProjects: profile?.totalProjectsCompleted ?? 0,
+          skills: skillRows.map((s) => s.skillName),
+          education:
+            profile?.educationMajor && profile.educationUniversity
+              ? `${profile.educationMajor} — ${profile.educationUniversity}`
+              : (profile?.educationMajor ?? profile?.educationUniversity ?? '-'),
           isExploration: rec.isExploration,
           workPackage: null,
-          domainExpertise: [],
-          availability: '-',
+          domainExpertise: profile?.domainExpertise ?? [],
+          availability: profile?.availabilityStatus ?? '-',
         }),
       )
     },
@@ -97,7 +143,9 @@ function useMatchingRecommendations(projectId: string, requiredSkills: string[])
 function MatchingPage() {
   const { t } = useTranslation('matching')
   const { projectId } = Route.useParams()
+  const navigate = useNavigate()
   const { data: project, isLoading: projectLoading } = useProject(projectId)
+  const confirmMatching = useConfirmMatching()
 
   const requiredSkills: string[] =
     ((project?.preferences as Record<string, unknown> | null)?.required_skills as string[]) ?? []
@@ -114,6 +162,14 @@ function MatchingPage() {
 
   function handleReject(talentId: string) {
     setDecisions((prev) => ({ ...prev, [talentId]: 'rejected' }))
+  }
+
+  async function handleConfirm() {
+    const approvedTalentIds = Object.entries(decisions)
+      .filter(([, v]) => v === 'approved')
+      .map(([k]) => k)
+    await confirmMatching.mutateAsync({ projectId, approvedTalentIds })
+    navigate({ to: '/projects/$projectId', params: { projectId } })
   }
 
   const approvedCount = Object.values(decisions).filter((d) => d === 'approved').length
@@ -202,9 +258,15 @@ function MatchingPage() {
           <div className="mt-6 flex justify-end">
             <button
               type="button"
-              className="inline-flex items-center gap-2 rounded-lg bg-primary-600 px-6 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-primary-600/90 transition-colors"
+              onClick={handleConfirm}
+              disabled={confirmMatching.isPending}
+              className="inline-flex items-center gap-2 rounded-lg bg-primary-600 px-6 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-primary-600/90 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
             >
-              <CheckCircle className="h-4 w-4" />
+              {confirmMatching.isPending ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <CheckCircle className="h-4 w-4" />
+              )}
               {t('confirm_selection')}
             </button>
           </div>
@@ -345,7 +407,7 @@ function TalentCard({
               'inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium',
               decision === 'approved'
                 ? 'bg-primary-600/15 text-success-600 border border-primary-500/20'
-                : 'bg-neutral-500/10 text-on-surface-muted border border-outline-dim/20',
+                : 'bg-surface-container/40 text-on-surface-muted border border-outline-dim/20',
             )}
           >
             {decision === 'approved' ? (

@@ -1,0 +1,274 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-typecheck:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Biome check
+        run: bun run check
+
+      - name: TypeScript type check
+        run: bunx turbo run typecheck
+
+  test-unit:
+    name: Unit & Integration Tests (TypeScript)
+    runs-on: ubuntu-latest
+    needs: lint-and-typecheck
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: bytz_test
+          POSTGRES_PASSWORD: bytz_test
+          POSTGRES_DB: bytz_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U bytz_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Run tests (verbose + coverage)
+        run: bunx turbo run test:coverage -- --reporter verbose --reporter default
+        env:
+          DATABASE_URL: postgresql://bytz_test:bytz_test@localhost:5432/bytz_test
+          DATABASE_DIRECT_URL: postgresql://bytz_test:bytz_test@localhost:5432/bytz_test
+          REDIS_URL: redis://localhost:6379
+          NATS_URL: nats://localhost:4222
+          BETTER_AUTH_SECRET: test-secret-minimum-32-characters-long
+          BETTER_AUTH_URL: http://localhost:3001
+          NODE_ENV: test
+
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ts-coverage-reports
+          path: |
+            packages/*/coverage/
+            apps/*/coverage/
+          retention-days: 14
+
+  test-go:
+    name: Go Tests
+    runs-on: ubuntu-latest
+    needs: lint-and-typecheck
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Payment Service Tests
+        working-directory: apps/payment-service
+        run: |
+          go test -v ./... -coverprofile=coverage.out -count=1
+          echo "--- Coverage Summary: payment-service ---"
+          go tool cover -func=coverage.out
+
+      - name: Notification Service Tests
+        working-directory: apps/notification-service
+        run: |
+          go test -v ./... -coverprofile=coverage.out -count=1
+          echo "--- Coverage Summary: notification-service ---"
+          go tool cover -func=coverage.out
+
+      - name: Admin Service Tests
+        working-directory: apps/admin-service
+        run: |
+          go test -v ./... -coverprofile=coverage.out -count=1
+          echo "--- Coverage Summary: admin-service ---"
+          go tool cover -func=coverage.out
+
+      - name: Upload Go coverage profiles
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-coverage-reports
+          path: apps/*/coverage.out
+          retention-days: 14
+
+  test-python:
+    name: Python Tests (AI Service)
+    runs-on: ubuntu-latest
+    needs: lint-and-typecheck
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.13'
+          enable-cache: true
+          cache-dependency-glob: 'apps/ai-service/uv.lock'
+
+      - name: AI Service Tests
+        working-directory: apps/ai-service
+        run: |
+          uv run pytest tests/ \
+            -v \
+            --tb=short \
+            --cov=app \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            -p no:warnings
+        env:
+          OTEL_DISABLED: "true"
+          NATS_DISABLED: "true"
+
+      - name: Upload Python coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-coverage-report
+          path: apps/ai-service/coverage.xml
+          retention-days: 14
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: lint-and-typecheck
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          exit-code: 1
+          ignore-unfixed: true
+
+      - name: Run Grype dependency scan
+        uses: anchore/scan-action@v6
+        with:
+          path: .
+          severity-cutoff: high
+          fail-build: true
+
+  build-ts:
+    name: Build TypeScript Services
+    runs-on: ubuntu-latest
+    needs: [test-unit, test-go, test-python, security-scan]
+    strategy:
+      matrix:
+        service: [auth-service, project-service, web, admin]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build
+        run: bunx turbo run build --filter=@kerjacus/${{ matrix.service }}
+
+  build-go:
+    name: Build Go Services
+    runs-on: ubuntu-latest
+    needs: [test-unit, test-go, test-python, security-scan]
+    strategy:
+      matrix:
+        service: [payment-service, notification-service, admin-service]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Build
+        working-directory: apps/${{ matrix.service }}
+        run: go build -o /dev/null ./...
+
+  build-docker:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+    needs: [build-ts, build-go]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    strategy:
+      matrix:
+        include:
+          - service: payment-service
+            context: apps/payment-service
+          - service: notification-service
+            context: apps/notification-service
+          - service: admin-service
+            context: apps/admin-service
+          - service: project-service
+            context: .
+          - service: auth-service
+            context: .
+          - service: ai-service
+            context: .
+          - service: web
+            context: .
+          - service: admin
+            context: .
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          if [ -f "apps/${{ matrix.service }}/Dockerfile" ]; then
+            docker build -t kerjacus/${{ matrix.service }}:latest -f apps/${{ matrix.service }}/Dockerfile ${{ matrix.context }}
+          fi
+
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: [build-ts, build-go]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to Coolify
+        run: |
+          echo "Deployment triggered for commit ${{ github.sha }}"
+          # Coolify webhook trigger would go here
+          # curl -X POST "$COOLIFY_WEBHOOK_URL" -H "Authorization: Bearer $COOLIFY_TOKEN"

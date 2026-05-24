@@ -137,10 +137,10 @@ export function useTransitionProject() {
   const queryClient = useQueryClient()
 
   return useMutation({
-    mutationFn: async ({ projectId, transition }: { projectId: string; transition: string }) => {
+    mutationFn: async ({ projectId, status }: { projectId: string; status: string }) => {
       const res = await apiFetch<ApiResponse<Project>>(`/api/v1/projects/${projectId}/transition`, {
         method: 'POST',
-        body: JSON.stringify({ transition }),
+        body: JSON.stringify({ status }),
       })
       return res.data
     },
@@ -350,12 +350,30 @@ export function useProjectContracts(projectId: string) {
     queryKey: ['project-contracts', projectId],
     queryFn: async () => {
       const res = await apiFetch<ApiResponse<ContractItem[]>>(
-        `/api/v1/projects/${projectId}/contracts`,
+        `/api/v1/contracts/project/${projectId}`,
       )
       return res.data ?? []
     },
     enabled: !!projectId,
     retry: false,
+  })
+}
+
+export function useSignContract() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ contractId, projectId }: { contractId: string; projectId: string }) => {
+      const res = await apiFetch<ApiResponse<ContractItem>>(
+        `/api/v1/contracts/${contractId}/sign`,
+        {
+          method: 'PATCH',
+        },
+      )
+      return { data: res.data, projectId }
+    },
+    onSuccess: ({ projectId }) => {
+      void queryClient.invalidateQueries({ queryKey: ['project-contracts', projectId] })
+    },
   })
 }
 
@@ -381,6 +399,84 @@ export function useActivities(limit = 5) {
         `/api/v1/activities?limit=${limit}`,
       )
       return res.data
+    },
+  })
+}
+
+export function useProjectInvoices(projectId: string) {
+  return useQuery({
+    queryKey: ['project-invoices', projectId],
+    queryFn: async () => {
+      const res = await apiFetch<
+        ApiResponse<
+          Array<{
+            invoiceNumber: string
+            milestoneId: string
+            pdfUrl: string
+            isAdminCopy: boolean
+            generatedAt: string
+          }>
+        >
+      >(`/api/v1/projects/${projectId}/invoices`)
+      return res.data ?? []
+    },
+    enabled: !!projectId,
+  })
+}
+
+export type ProjectDispute = {
+  id: string
+  projectId: string
+  workPackageId: string | null
+  initiatedBy: string
+  againstUserId: string
+  reason: string
+  evidenceUrls: string[] | null
+  status: 'open' | 'under_review' | 'mediation' | 'resolved' | 'escalated'
+  resolution: string | null
+  resolutionType: 'funds_to_talent' | 'funds_to_owner' | 'split' | null
+  resolvedBy: string | null
+  resolvedAt: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export function useProjectDisputes(projectId: string) {
+  return useQuery({
+    queryKey: ['project-disputes', projectId],
+    queryFn: async () => {
+      const res = await apiFetch<ApiResponse<ProjectDispute[]>>(
+        `/api/v1/disputes/project/${projectId}`,
+      )
+      return res.data ?? []
+    },
+    enabled: !!projectId,
+    retry: false,
+  })
+}
+
+export function useConfirmMatching() {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: async ({
+      projectId,
+      approvedTalentIds,
+    }: {
+      projectId: string
+      approvedTalentIds: string[]
+    }) => {
+      const res = await apiFetch<ApiResponse<{ projectId: string; matched: number }>>(
+        '/api/v1/matching/confirm',
+        {
+          method: 'POST',
+          body: JSON.stringify({ projectId, approvedTalentIds }),
+        },
+      )
+      return res.data
+    },
+    onSuccess: (_data, { projectId }) => {
+      queryClient.invalidateQueries({ queryKey: ['project', projectId] })
     },
   })
 }

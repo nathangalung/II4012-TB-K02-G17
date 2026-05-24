@@ -7,21 +7,30 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/bytz/payment-service/internal/observability"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const serviceSource = "payment-service"
 
+var tracer = otel.Tracer("payment-service-outbox")
+
 // Envelope mirrors the canonical NATS event shape consumed by other services.
+// CorrelationID is the trace_id of the publish span — empty if no valid span.
 type Envelope struct {
-	ID        string          `json:"id"`
-	Type      string          `json:"type"`
-	Source    string          `json:"source"`
-	Timestamp string          `json:"timestamp"`
-	Data      json.RawMessage `json:"data"`
+	ID            string          `json:"id"`
+	Type          string          `json:"type"`
+	Source        string          `json:"source"`
+	Timestamp     string          `json:"timestamp"`
+	CorrelationID string          `json:"correlationId,omitempty"`
+	Data          json.RawMessage `json:"data"`
 }
 
 // OutboxPublisher polls outbox_events and forwards them to NATS JetStream.
@@ -80,7 +89,7 @@ func (p *OutboxPublisher) loop(ctx context.Context) {
 
 func (p *OutboxPublisher) pollAndPublish(ctx context.Context) (int, error) {
 	rows, err := p.pool.Query(ctx, `
-		SELECT id, event_type, payload, created_at, retry_count
+		SELECT id, event_type, payload, created_at, retry_count, trace_context
 		FROM outbox_events
 		WHERE published = false AND retry_count < 3
 		ORDER BY created_at ASC
@@ -92,16 +101,17 @@ func (p *OutboxPublisher) pollAndPublish(ctx context.Context) (int, error) {
 	defer rows.Close()
 
 	type row struct {
-		id         string
-		eventType  string
-		payload    []byte
-		createdAt  time.Time
-		retryCount int
+		id           string
+		eventType    string
+		payload      []byte
+		createdAt    time.Time
+		retryCount   int
+		traceContext []byte
 	}
 	var batch []row
 	for rows.Next() {
 		var r row
-		if err := rows.Scan(&r.id, &r.eventType, &r.payload, &r.createdAt, &r.retryCount); err != nil {
+		if err := rows.Scan(&r.id, &r.eventType, &r.payload, &r.createdAt, &r.retryCount, &r.traceContext); err != nil {
 			return 0, fmt.Errorf("scan outbox row: %w", err)
 		}
 		batch = append(batch, r)
@@ -112,25 +122,22 @@ func (p *OutboxPublisher) pollAndPublish(ctx context.Context) (int, error) {
 
 	published := 0
 	for _, r := range batch {
-		envelope := Envelope{
-			ID:        r.id,
-			Type:      r.eventType,
-			Source:    serviceSource,
-			Timestamp: r.createdAt.UTC().Format(time.RFC3339Nano),
-			Data:      r.payload,
-		}
-		body, err := json.Marshal(envelope)
-		if err != nil {
-			p.markRetry(ctx, r.id, r.retryCount+1, err.Error())
-			continue
+		publishCtx := ctx
+		if len(r.traceContext) > 0 {
+			var carrier map[string]string
+			if err := json.Unmarshal(r.traceContext, &carrier); err != nil {
+				slog.Warn("restore trace context failed", "id", r.id, "error", err)
+			} else {
+				publishCtx = observability.RestoreTraceContext(ctx, carrier)
+			}
 		}
 
-		_, err = p.js.Publish(ctx, r.eventType, body, jetstream.WithMsgID(r.id))
-		if err != nil {
+		pubErr := p.publishWithTrace(publishCtx, r.id, r.eventType, r.payload, r.createdAt)
+		if pubErr != nil {
 			retry := r.retryCount + 1
-			p.markRetry(ctx, r.id, retry, err.Error())
+			p.markRetry(ctx, r.id, retry, pubErr.Error())
 			if retry >= 3 {
-				p.moveToDLQ(ctx, r.id, r.eventType, r.payload, err.Error(), retry)
+				p.moveToDLQ(ctx, r.id, r.eventType, r.payload, r.traceContext, pubErr.Error(), retry)
 			}
 			continue
 		}
@@ -145,6 +152,51 @@ func (p *OutboxPublisher) pollAndPublish(ctx context.Context) (int, error) {
 	return published, nil
 }
 
+// publishWithTrace wraps JetStream publish in a PRODUCER span, builds the
+// envelope (stamping correlationId = trace_id), and injects W3C trace context
+// into the message headers for downstream consumers.
+func (p *OutboxPublisher) publishWithTrace(ctx context.Context, id, eventType string, payload []byte, createdAt time.Time) error {
+	ctx, span := tracer.Start(ctx, fmt.Sprintf("nats.publish %s", eventType),
+		trace.WithSpanKind(trace.SpanKindProducer),
+		trace.WithAttributes(
+			attribute.String("messaging.system", "nats"),
+			attribute.String("messaging.destination.name", eventType),
+			attribute.String("messaging.message.id", id),
+			attribute.String("messaging.operation", "publish"),
+		),
+	)
+	defer span.End()
+
+	envelope := Envelope{
+		ID:        id,
+		Type:      eventType,
+		Source:    serviceSource,
+		Timestamp: createdAt.UTC().Format(time.RFC3339Nano),
+		Data:      payload,
+	}
+	if sc := span.SpanContext(); sc.IsValid() {
+		envelope.CorrelationID = sc.TraceID().String()
+	}
+	body, err := json.Marshal(envelope)
+	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
+		return fmt.Errorf("marshal envelope: %w", err)
+	}
+
+	msg := &nats.Msg{
+		Subject: eventType,
+		Data:    body,
+		Header:  nats.Header{},
+	}
+	observability.InjectNATSHeaders(ctx, msg.Header)
+
+	if _, err := p.js.PublishMsg(ctx, msg, jetstream.WithMsgID(id)); err != nil {
+		span.SetStatus(codes.Error, err.Error())
+		return err
+	}
+	return nil
+}
+
 func (p *OutboxPublisher) markRetry(ctx context.Context, id string, retry int, errMsg string) {
 	_, err := p.pool.Exec(ctx,
 		`UPDATE outbox_events SET retry_count = $1, error_message = $2 WHERE id = $3`,
@@ -154,13 +206,17 @@ func (p *OutboxPublisher) markRetry(ctx context.Context, id string, retry int, e
 	}
 }
 
-func (p *OutboxPublisher) moveToDLQ(ctx context.Context, originalID, eventType string, payload []byte, errMsg string, retry int) {
+func (p *OutboxPublisher) moveToDLQ(ctx context.Context, originalID, eventType string, payload, traceContext []byte, errMsg string, retry int) {
 	dlqID := uuid.Must(uuid.NewV7()).String()
+	var traceArg any
+	if len(traceContext) > 0 {
+		traceArg = traceContext
+	}
 	_, err := p.pool.Exec(ctx, `
 		INSERT INTO dead_letter_events
-			(id, original_event_id, event_type, payload, consumer_service, error_message, retry_count, reprocessed, created_at)
-		VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, false, NOW())
-	`, dlqID, originalID, eventType, payload, "payment-service-outbox", errMsg, retry)
+			(id, original_event_id, event_type, payload, trace_context, consumer_service, error_message, retry_count, reprocessed, created_at)
+		VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7, $8, false, NOW())
+	`, dlqID, originalID, eventType, payload, traceArg, "payment-service-outbox", errMsg, retry)
 	if err != nil {
 		slog.Warn("DLQ insert failed", "id", originalID, "error", err)
 	}

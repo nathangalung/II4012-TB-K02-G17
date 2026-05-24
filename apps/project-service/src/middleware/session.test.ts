@@ -2,12 +2,7 @@ import { AppError } from '@kerjacus/shared'
 import { Hono } from 'hono'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { getAuthUser, sessionMiddleware } from './session'
-
-// Mock session-cache
-vi.mock('./session-cache', () => ({
-  getCachedSession: vi.fn().mockReturnValue(null),
-  setCachedSession: vi.fn(),
-}))
+import * as sessionCache from './session-cache'
 
 type ErrorBody = { success: boolean; error: { code: string; message: string }; user?: unknown }
 
@@ -45,16 +40,18 @@ describe('getAuthUser', () => {
 
 describe('sessionMiddleware', () => {
   const originalEnv = { ...process.env }
+  const originalFetch = globalThis.fetch
 
   beforeEach(() => {
-    vi.resetModules()
     process.env.BETTER_AUTH_URL = 'http://localhost:3001'
+    vi.spyOn(sessionCache, 'getCachedSession').mockReturnValue(null)
+    vi.spyOn(sessionCache, 'setCachedSession').mockImplementation(() => {})
   })
 
   afterEach(() => {
     process.env = { ...originalEnv }
+    globalThis.fetch = originalFetch
     vi.restoreAllMocks()
-    vi.unstubAllGlobals()
   })
 
   function createApp() {
@@ -79,9 +76,8 @@ describe('sessionMiddleware', () => {
   })
 
   it('returns cached session when available', async () => {
-    const { getCachedSession } = await import('./session-cache')
     const mockUser = { id: 'u1', email: 'a@b.com', name: 'Cached', role: 'owner' }
-    vi.mocked(getCachedSession).mockReturnValue(mockUser)
+    vi.spyOn(sessionCache, 'getCachedSession').mockReturnValue(mockUser)
 
     const app = createApp()
     const res = await app.request('/test', {
@@ -94,15 +90,12 @@ describe('sessionMiddleware', () => {
   })
 
   it('calls auth service when not cached', async () => {
-    const { getCachedSession, setCachedSession } = await import('./session-cache')
-    vi.mocked(getCachedSession).mockReturnValue(null)
-
     const mockUser = { id: 'u2', email: 'b@c.com', name: 'Fresh', role: 'talent' }
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,
       json: () => Promise.resolve({ user: mockUser }),
     })
-    vi.stubGlobal('fetch', mockFetch)
+    globalThis.fetch = mockFetch as unknown as typeof fetch
 
     const app = createApp()
     const res = await app.request('/test', {
@@ -116,15 +109,12 @@ describe('sessionMiddleware', () => {
         headers: expect.objectContaining({ Cookie: 'session=xyz789' }),
       }),
     )
-    expect(setCachedSession).toHaveBeenCalled()
+    expect(sessionCache.setCachedSession).toHaveBeenCalled()
   })
 
   it('returns 401 when auth service returns non-ok', async () => {
-    const { getCachedSession } = await import('./session-cache')
-    vi.mocked(getCachedSession).mockReturnValue(null)
-
     const mockFetch = vi.fn().mockResolvedValue({ ok: false })
-    vi.stubGlobal('fetch', mockFetch)
+    globalThis.fetch = mockFetch as unknown as typeof fetch
 
     const app = createApp()
     const res = await app.request('/test', {
@@ -137,14 +127,11 @@ describe('sessionMiddleware', () => {
   })
 
   it('returns 401 when auth service returns no user', async () => {
-    const { getCachedSession } = await import('./session-cache')
-    vi.mocked(getCachedSession).mockReturnValue(null)
-
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,
       json: () => Promise.resolve({}),
     })
-    vi.stubGlobal('fetch', mockFetch)
+    globalThis.fetch = mockFetch as unknown as typeof fetch
 
     const app = createApp()
     const res = await app.request('/test', {
@@ -157,11 +144,8 @@ describe('sessionMiddleware', () => {
   })
 
   it('returns 503 when auth service is unreachable', { timeout: 15_000 }, async () => {
-    const { getCachedSession } = await import('./session-cache')
-    vi.mocked(getCachedSession).mockReturnValue(null)
-
     const mockFetch = vi.fn().mockRejectedValue(new Error('ECONNREFUSED'))
-    vi.stubGlobal('fetch', mockFetch)
+    globalThis.fetch = mockFetch as unknown as typeof fetch
 
     const app = createApp()
     const res = await app.request('/test', {

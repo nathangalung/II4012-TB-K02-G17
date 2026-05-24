@@ -8,20 +8,31 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/bytz/notification-service/internal/idempotency"
+	"github.com/bytz/notification-service/internal/observability"
 	"github.com/bytz/notification-service/internal/sender"
 	"github.com/bytz/notification-service/internal/store"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
+var tracer = otel.Tracer("notification-service-consumer")
+
 // NATSEvent mirrors the shared event envelope.
+// CorrelationID is the publisher's trace_id, used to correlate downstream
+// processing with the original request across services.
 type NATSEvent struct {
-	ID        string          `json:"id"`
-	Type      string          `json:"type"`
-	Source    string          `json:"source"`
-	Timestamp string          `json:"timestamp"`
-	Data      json.RawMessage `json:"data"`
+	ID            string          `json:"id"`
+	Type          string          `json:"type"`
+	Source        string          `json:"source"`
+	Timestamp     string          `json:"timestamp"`
+	CorrelationID string          `json:"correlationId,omitempty"`
+	Data          json.RawMessage `json:"data"`
 }
 
 // NotificationSendPayload for notification.send events.
@@ -87,17 +98,22 @@ type Consumer struct {
 	db         *pgxpool.Pool
 	email      *sender.EmailSender
 	centrifugo *sender.CentrifugoSender
+	idem       idempotency.Idempotency
 	nc         *nats.Conn
 	js         jetstream.JetStream
 	contexts   []jetstream.ConsumeContext
 }
 
-func New(notifStore *store.Store, db *pgxpool.Pool, emailSender *sender.EmailSender, centrifugoSender *sender.CentrifugoSender) *Consumer {
+func New(notifStore *store.Store, db *pgxpool.Pool, emailSender *sender.EmailSender, centrifugoSender *sender.CentrifugoSender, idem idempotency.Idempotency) *Consumer {
+	if idem == nil {
+		idem = idempotency.NoOp{}
+	}
 	return &Consumer{
 		store:      notifStore,
 		db:         db,
 		email:      emailSender,
 		centrifugo: centrifugoSender,
+		idem:       idem,
 	}
 }
 
@@ -174,20 +190,65 @@ func (c *Consumer) subscribeStream(ctx context.Context, def streamConsumerDef) e
 }
 
 func (c *Consumer) handleMessage(ctx context.Context, msg jetstream.Msg) {
+	hdrs := nats.Header(msg.Headers())
+	ctx = observability.ExtractNATSHeaders(ctx, hdrs)
+
+	ctx, span := tracer.Start(ctx, fmt.Sprintf("nats.consume %s", msg.Subject()),
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(
+			attribute.String("messaging.system", "nats"),
+			attribute.String("messaging.destination.name", msg.Subject()),
+			attribute.String("messaging.operation", "process"),
+		),
+	)
+	defer span.End()
+
 	var event NATSEvent
 	if err := json.Unmarshal(msg.Data(), &event); err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		slog.Error("unmarshal event", "error", err, "subject", msg.Subject())
 		// Bad data — ack to avoid redelivery loop.
 		_ = msg.Ack()
 		return
 	}
 
-	slog.Info("processing event", "type", event.Type, "id", event.ID, "subject", msg.Subject())
+	span.SetAttributes(
+		attribute.String("messaging.message.id", event.ID),
+		attribute.String("event.type", event.Type),
+	)
+	if event.CorrelationID != "" {
+		span.SetAttributes(attribute.String("correlation.id", event.CorrelationID))
+	}
+
+	if event.ID != "" {
+		seen, err := c.idem.Seen(ctx, event.ID)
+		if err != nil {
+			// Fail open: log + continue. JetStream MaxDeliver still bounds dup risk.
+			slog.Warn("idempotency check failed; processing anyway", "error", err, "id", event.ID, "correlationId", event.CorrelationID)
+		} else if seen {
+			span.SetAttributes(attribute.Bool("messaging.duplicate", true))
+			slog.Debug("skipping duplicate event", "type", event.Type, "id", event.ID, "correlationId", event.CorrelationID)
+			if err := msg.Ack(); err != nil {
+				slog.Error("ack duplicate", "error", err, "subject", msg.Subject())
+			}
+			return
+		}
+	}
+
+	slog.Info("processing event", "type", event.Type, "id", event.ID, "subject", msg.Subject(), "correlationId", event.CorrelationID)
 
 	if err := c.processEvent(ctx, event); err != nil {
-		slog.Error("process event failed", "error", err, "type", event.Type, "id", event.ID)
+		span.SetStatus(codes.Error, err.Error())
+		slog.Error("process event failed", "error", err, "type", event.Type, "id", event.ID, "correlationId", event.CorrelationID)
 		_ = msg.Nak()
 		return
+	}
+
+	if event.ID != "" {
+		if err := c.idem.MarkSeen(ctx, event.ID); err != nil {
+			// Don't fail the message — duplicate next time is cheaper than reprocessing now.
+			slog.Warn("idempotency mark failed", "error", err, "id", event.ID, "correlationId", event.CorrelationID)
+		}
 	}
 
 	if err := msg.Ack(); err != nil {
@@ -508,6 +569,10 @@ func (c *Consumer) createAndDeliver(
 	link *string,
 	channels []string,
 ) error {
+	if userID == "" {
+		slog.Warn("createAndDeliver: empty userID, skipping notification", "type", string(notifType), "title", title)
+		return nil
+	}
 	notif, err := c.store.Create(ctx, store.CreateInput{
 		UserID:  userID,
 		Type:    notifType,
@@ -519,9 +584,9 @@ func (c *Consumer) createAndDeliver(
 		return fmt.Errorf("create notification: %w", err)
 	}
 
-	// Push real-time via Centrifugo.
+	// Push real-time via Centrifugo (best-effort — Centrifugo may not be running).
 	if err := c.centrifugo.PublishUserNotification(ctx, userID, notif); err != nil {
-		slog.Error("centrifugo publish failed", "error", err, "userId", userID)
+		slog.Warn("centrifugo publish failed", "error", err, "userId", userID)
 	}
 
 	// Deliver via each requested channel.
@@ -557,6 +622,12 @@ func (c *Consumer) Close() {
 	if c.nc != nil {
 		c.nc.Close()
 	}
+}
+
+// IsConnected reports whether the underlying NATS connection is healthy.
+// Returns false if the consumer never started or has since disconnected.
+func (c *Consumer) IsConnected() bool {
+	return c.nc != nil && c.nc.IsConnected()
 }
 
 func strPtr(s string) *string {

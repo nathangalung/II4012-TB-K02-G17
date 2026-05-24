@@ -1,23 +1,16 @@
-import {
-  getDb,
-  outboxEvents,
-  projectAssignments,
-  projects,
-  talentProfiles,
-  timeLogs,
-} from '@kerjacus/db'
+import { getDb, projectAssignments, projects, talentProfiles, timeLogs } from '@kerjacus/db'
 import { AppError } from '@kerjacus/shared'
 import { and, eq } from 'drizzle-orm'
 import { Hono } from 'hono'
-import { uuidv7 } from 'uuidv7'
 import { z } from 'zod'
+import { appendOutboxEvent } from '../lib/outbox'
 import { getAuthUser } from '../middleware/session'
 import { TimeLogRepository } from '../repositories/time-log.repository'
 import { TimeLogService } from '../services/time-log.service'
 
 const createTimeLogSchema = z.object({
   taskId: z.string(),
-  talentId: z.string(),
+  talentId: z.string().optional(),
   startedAt: z.iso.datetime(),
   endedAt: z.iso.datetime().optional(),
   durationMinutes: z.number().int().positive().optional(),
@@ -56,27 +49,30 @@ timeLogRoute.post('/', async (c) => {
     })
   }
 
-  // Verify the authenticated user owns the talent profile being logged for
   const user = getAuthUser(c)
   const db = getDb()
+
+  // Resolve talent profile from session if not provided in payload
+  const lookupClause = parsed.data.talentId
+    ? eq(talentProfiles.id, parsed.data.talentId)
+    : eq(talentProfiles.userId, user.id)
   const [profile] = await db
     .select({ id: talentProfiles.id, userId: talentProfiles.userId })
     .from(talentProfiles)
-    .where(eq(talentProfiles.id, parsed.data.talentId))
+    .where(lookupClause)
     .limit(1)
   if (!profile || profile.userId !== user.id) {
     throw new AppError('AUTH_FORBIDDEN', 'Can only log time for your own talent profile')
   }
 
   const service = getService()
-  const log = await service.createTimeLog(parsed.data)
+  const log = await service.createTimeLog({ ...parsed.data, talentId: profile.id })
 
-  await db.insert(outboxEvents).values({
-    id: uuidv7(),
+  await appendOutboxEvent(db, {
     aggregateType: 'time_log',
     aggregateId: log.id,
     eventType: 'time_log.created',
-    payload: { timeLogId: log.id, taskId: parsed.data.taskId, talentId: parsed.data.talentId },
+    payload: { timeLogId: log.id, taskId: parsed.data.taskId, talentId: profile.id },
   })
 
   return c.json(
@@ -118,8 +114,7 @@ timeLogRoute.post('/:id/stop', async (c) => {
   const service = getService()
   const result = await service.stopTimer(id)
 
-  await db.insert(outboxEvents).values({
-    id: uuidv7(),
+  await appendOutboxEvent(db, {
     aggregateType: 'time_log',
     aggregateId: id,
     eventType: 'time_log.stopped',
